@@ -214,6 +214,7 @@ static int parse_form(struct openconnect_info *vpninfo, struct oc_auth_form *for
 		opt->name = input_name;
 		opt->label = input_label;
 		opt->flags = prop_equals(xml_node, "second-auth", "1") ? OC_FORM_OPT_SECOND_AUTH : 0;
+        opt->flags = prop_equals(xml_node, "second-auth", "1") || prop_equals(xml_node, "name", "secondary_password") ? OC_FORM_OPT_SECOND_AUTH : 0;
 
 		if (!strcmp(input_type, "hidden")) {
 			opt->type = OC_FORM_OPT_HIDDEN;
@@ -221,10 +222,7 @@ static int parse_form(struct openconnect_info *vpninfo, struct oc_auth_form *for
 		} else if (!strcmp(input_type, "text")) {
 			opt->type = OC_FORM_OPT_TEXT;
 		} else if (!strcmp(input_type, "password")) {
-			if (!cstp_can_gen_tokencode(vpninfo, form, opt))
-				opt->type = OC_FORM_OPT_TOKEN;
-			else
-				opt->type = OC_FORM_OPT_PASSWORD;
+			opt->type = opt->flags == OC_FORM_OPT_SECOND_AUTH ? OC_FORM_OPT_TOKEN : OC_FORM_OPT_PASSWORD;
 		} else {
 			vpn_progress(vpninfo, PRG_INFO,
 				     _("Unknown input type %s in form\n"),
