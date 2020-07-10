@@ -1,6 +1,6 @@
 .TH OPENCONNECT 8
 .SH NAME
-openconnect \- Connect to Cisco AnyConnect VPN
+openconnect \- Multi-protocol VPN client, for Cisco AnyConnect VPNs and others
 .SH SYNOPSIS
 .SY openconnect
 .OP \-\-config configfile
@@ -15,6 +15,8 @@ openconnect \- Connect to Cisco AnyConnect VPN
 .OP \-d,\-\-deflate
 .OP \-D,\-\-no\-deflate
 .OP \-\-force\-dpd interval
+.OP \-\-force\-trojan interval
+.OP \-F,\-\-form\-entry form:opt=value
 .OP \-g,\-\-usergroup group
 .OP \-h,\-\-help
 .OP \-\-http\-auth methods
@@ -47,6 +49,7 @@ openconnect \- Connect to Cisco AnyConnect VPN
 .OP \-\-cafile file
 .OP \-\-disable\-ipv6
 .OP \-\-dtls\-ciphers list
+.OP \-\-dtls12\-ciphers list
 .OP \-\-dtls\-local\-port port
 .OP \-\-dump\-http\-traffic
 .OP \-\-no\-system\-trust
@@ -64,6 +67,7 @@ openconnect \- Connect to Cisco AnyConnect VPN
 .OP \-\-resolve host:ip
 .OP \-\-servercert sha1
 .OP \-\-useragent string
+.OP \-\-version\-string string
 .OP \-\-local-hostname string
 .OP \-\-os string
 .B [https://]\fIserver\fB[:\fIport\fB][/\fIgroup\fB]
@@ -72,23 +76,34 @@ openconnect \- Connect to Cisco AnyConnect VPN
 .SH DESCRIPTION
 The program
 .B openconnect
-connects to Cisco "AnyConnect" VPN servers, which use standard TLS
-and DTLS protocols for data transport.
+connects to VPN servers which use standard TLS/SSL, DTLS, and ESP
+protocols for data transport.
+
+It was originally written to support Cisco "AnyConnect" VPN servers,
+and has since been extended with experimental support for Juniper
+Network Connect
+.RB ( \-\-protocol=nc )
+and Junos Pulse VPN servers
+.RB ( \-\-protocol=pulse )
+and PAN GlobalProtect VPN servers
+.RB ( \-\-protocol=gp ).
 
 The connection happens in two phases. First there is a simple HTTPS
 connection over which the user authenticates somehow \- by using a
 certificate, or password or SecurID, etc.  Having authenticated, the
-user is rewarded with an HTTP cookie which can be used to make the
+user is rewarded with an authentication cookie which can be used to make the
 real VPN connection.
 
-The second phase uses that cookie in an HTTPS
-.I CONNECT
-request, and data packets can be passed over the resulting
-connection. In auxiliary headers exchanged with the
-.I CONNECT
-request, a Session\-ID and Master Secret for a DTLS connection are also
-exchanged, which allows data transport over UDP to occur.
-
+The second phase uses that cookie to connect to a tunnel via HTTPS,
+and data packets can be passed over the resulting connection. When
+possible, a UDP tunnel is also configured: AnyConnect uses DTLS, while
+Juniper and GlobalProtect use UDP-encapsulated ESP. The UDP tunnel
+may be disabled with
+.BR \-\-no\-dtls ,
+but is preferred when correctly supported by the server and network
+for performance reasons. (TCP performs poorly and unreliably over
+TCP-based tunnels; see
+.IR http://sites.inka.de/~W1011/devel/tcp-tcp.html .)
 
 .SH OPTIONS
 .TP
@@ -130,8 +145,8 @@ which may be either a file name or, if OpenConnect has been built with an approp
 version of GnuTLS, a PKCS#11 URL.
 .TP
 .B \-C,\-\-cookie=COOKIE
-Use WebVPN cookie.
-.I COOKIE
+Use authentication cookie
+.IR COOKIE .
 .TP
 .B \-\-cookie\-on\-stdin
 Read cookie from standard input.
@@ -147,11 +162,10 @@ Disable all compression.
 Set compression mode, where
 .I MODE
 is one of
-.I "stateless"
-,
-.I "none"
-, or
-.I "all".
+.IR "stateless" ,
+.IR "none" ,
+or
+.IR "all" .
 
 By default, only stateless compression algorithms which do not maintain state
 from one packet to the next (and which can be used on UDP transports) are
@@ -159,17 +173,30 @@ enabled. By setting the mode to
 .I "all"
 stateful algorithms (currently only zlib deflate) can be enabled. Or all
 compression can be disabled by setting the mode to
-.I "none".
+.IR "none" .
 .TP
 .B \-\-force\-dpd=INTERVAL
 Use
 .I INTERVAL
-as minimum Dead Peer Detection interval for CSTP and DTLS, forcing use of DPD even when the server doesn't request it.
+as minimum Dead Peer Detection interval (in seconds) for CSTP and DTLS, forcing use of DPD even when the server doesn't request it.
 .TP
 .B \-g,\-\-usergroup=GROUP
 Use
 .I GROUP
 as login UserGroup
+.TP
+.B \-F,\-\-form\-entry=FORM:OPTION=VALUE
+Provide authentication form input, where
+.I FORM
+and
+.I OPTION
+are the identifiers from the form and the specific input field, and
+.I VALUE
+is the string to be filled in automatically. For example, the standard username field
+.I (also handled by the \-\-user option)
+could also be provided with this option thus:
+.I \-\-form\-entry
+.IR main:username=joebloggs .
 .TP
 .B \-h,\-\-help
 Display help text
@@ -195,19 +222,27 @@ Use syslog for progress messages
 Prepend a timestamp to each progress message
 .TP
 .B \-\-passtos
-Copy TOS / TCLASS of payload packet into DTLS packets.
+Copy TOS / TCLASS of payload packet into DTLS and ESP packets. This is
+not set by default because it may leak information about the payload
+(for example, by differentiating voice/video traffic).
 .TP
 .B \-U,\-\-setuid=USER
 Drop privileges after connecting, to become user
 .I USER
 .TP
 .B \-\-csd\-user=USER
-Drop privileges during CSD (Cisco Secure Desktop) script execution.
+Drop privileges during execution of trojan binary or script (CSD, TNCC, or HIP).
 .TP
 .B \-\-csd\-wrapper=SCRIPT
 Run
 .I SCRIPT
-instead of the CSD (Cisco Secure Desktop) script.
+instead of the trojan binary or script.
+.TP
+.B \-\-force-trojan=INTERVAL
+Use
+.I INTERVAL
+as interval (in seconds) for repeat execution of Trojan binary or script, overriding default and/or
+server-set interval.
 .TP
 .B \-m,\-\-mtu=MTU
 Request
@@ -250,7 +285,7 @@ Passphrase for certificate file is automatically generated from the
 .I fsid
 of the file system on which it is stored. The
 .I fsid
-is obtained from the 
+is obtained from the
 .BR statvfs (2)
 or
 .BR statfs (2)
@@ -331,13 +366,24 @@ connection as root:
 .fi
 .TP
 .B \-\-cookieonly
-Fetch webvpn cookie only; don't connect
+Fetch and print cookie only; don't connect
 .TP
 .B \-\-printcookie
-Print webvpn cookie before connecting
+Print cookie before connecting
 .TP
 .B \-\-cafile=FILE
-Cert file for server verification
+Additional CA file for server verification. By default, this simply
+causes OpenConnect to trust additional root CA certificate(s) in
+addition to those trusted by the system. Use
+.B \-\-no\-system\-trust
+to prevent OpenConnect from trusting the system default certificate
+authorities.
+.TP
+.B \-\-no\-system\-trust
+Do not trust the system default certificate authorities. If this option is
+given, only certificate authorities given with the
+.B \-\-cafile
+option, if any, will be trusted automatically.
 .TP
 .B \-\-disable\-ipv6
 Do not advertise IPv6 capability to server
@@ -345,20 +391,17 @@ Do not advertise IPv6 capability to server
 .B \-\-dtls\-ciphers=LIST
 Set OpenSSL ciphers to support for DTLS
 .TP
+.B \-\-dtls12\-ciphers=LIST
+Set OpenSSL ciphers for Cisco's DTLS v1.2
+.TP
 .B \-\-dtls\-local\-port=PORT
 Use
 .I PORT
-as the local port for DTLS datagrams
+as the local port for DTLS and UDP datagrams
 .TP
 .B \-\-dump\-http\-traffic
 Enable verbose output of all HTTP requests and the bodies of all responses
 received from the server.
-.TP
-.B \-\-no\-system\-trust
-Do not trust the system default certificate authorities. If this option is
-given, only certificate authorities given with the
-.B \-\-cafile
-option, if any, will be trusted automatically.
 
 .TP
 .B \-\-pfs
@@ -374,7 +417,7 @@ setting.
 
 .TP
 .B \-\-no\-dtls
-Disable DTLS
+Disable DTLS and ESP
 .TP
 .B \-\-no\-http\-keepalive
 Version 8.2.2.5 of the Cisco ASA software has a bug where it will forget
@@ -422,11 +465,22 @@ Select VPN protocol
 .I PROTO
 to be used for the connection. Supported protocols are
 .I anyconnect
-for Cisco AnyConnect (the default), and
+for Cisco AnyConnect (the default),
 .I nc
 for experimental support for Juniper Network Connect (also supported
-by Junos Pulse servers).
+by most Junos Pulse servers),
+.I pulse
+for experimental support for Junos Pulse, and
+.I gp
+for experimental support for PAN GlobalProtect.
 
+OpenConnect does not yet support all of the authentication options used
+by Pulse, nor does it support Host Checker/TNCC with Pulse. If your
+Junos Pulse VPN is not yet supported with
+.BR \-\-protocol=pulse ,
+then
+.B \-\-protocol=nc
+may be a useful fallback option.
 .TP
 .B \-\-token\-mode=MODE
 Enable one-time password generation using the
@@ -439,7 +493,8 @@ will call liboath to generate an RFC 6238 time-based password, and
 .B \-\-token\-mode=hotp
 will call liboath to generate an RFC 4226 HMAC-based password. Yubikey
 tokens which generate OATH codes in hardware are supported with
-.B \-\-token\-mode=yubioath
+.B \-\-token\-mode=yubioath. \-\-token\-mode=oidc will use the provided 
+OpenIDConnect token as an RFC 6750 bearer token.
 .TP
 .B \-\-token\-secret={ SECRET[,COUNTER] | @FILENAME }
 The secret to use when generating one-time passwords/verification codes.
@@ -453,6 +508,8 @@ CTF string (with or without dashes).
 For Yubikey OATH the token secret specifies the name of the credential to be
 used. If not provided, the first OATH credential found on the device will be
 used.
+
+For OIDC the secret is the bearer token to be used.
 
 .IR FILENAME ,
 if specified, can contain any of the above strings.  Or, it can contain a
@@ -495,6 +552,12 @@ Use
 as 'User\-Agent:' field value in HTTP header.
 (e.g. \-\-useragent 'Cisco AnyConnect VPN Agent for Windows 2.2.0133')
 .TP
+.B \-\-version\-string=STRING
+Use
+.I STRING
+as the software version reported to the head end.
+(e.g. \-\-version\-string '2.2.0133')
+.TP
 .B \-\-local-hostname=STRING
 Use
 .I STRING
@@ -517,7 +580,7 @@ if this code is not executable on the local machine.
 .SH SIGNALS
 In the data phase of the connection, the following signals are handled:
 .TP
-.B SIGINT
+.B SIGINT / SIGTERM
 performs a clean shutdown by logging the session off, disconnecting from the
 gateway, and running the vpnc\-script to restore the network configuration.
 .TP
@@ -530,8 +593,6 @@ session off; this allows for reconnection later using
 forces an immediate disconnection and reconnection; this can be used to
 quickly recover from LAN IP address changes.
 .TP
-.B SIGTERM
-exits immediately without logging off or running vpnc\-script.
 .SH LIMITATIONS
 Note that although IPv6 has been tested on all platforms on which
 .B openconnect
@@ -542,6 +603,8 @@ to configure the network. The standard
 shipped with vpnc 0.5.3 is not capable of setting up IPv6 routes; the one from
 .B git://git.infradead.org/users/dwmw2/vpnc\-scripts.git
 will be required.
+.SH SEE ALSO
+.BR ocserv (8)
 
 .SH AUTHORS
 David Woodhouse <dwmw2@infradead.org>

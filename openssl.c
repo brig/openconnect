@@ -24,6 +24,7 @@
 
 #include "openconnect-internal.h"
 
+#include <openssl/crypto.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/engine.h>
@@ -48,6 +49,17 @@ typedef int (*X509_STORE_CTX_get_issuer_fn)(X509 **issuer,
 					    X509_STORE_CTX *ctx, X509 *x);
 #define X509_STORE_CTX_get_get_issuer(ctx) ((ctx)->get_issuer)
 #endif
+
+static char tls_library_version[32] = "";
+
+const char *openconnect_get_tls_library_version()
+{
+	if (!*tls_library_version) {
+		strncpy(tls_library_version, SSLeay_version(SSLEAY_VERSION), sizeof(tls_library_version));
+		tls_library_version[sizeof(tls_library_version)-1]='\0';
+	}
+	return tls_library_version;
+}
 
 int openconnect_sha1(unsigned char *result, void *data, int len)
 {
@@ -335,12 +347,9 @@ struct ui_form_opt {
 };
 
 #ifdef HAVE_ENGINE
- /* Ick. But there is no way to pass this sanely through OpenSSL */
-static struct openconnect_info *ui_vpninfo;
-
 static int ui_open(UI *ui)
 {
-	struct openconnect_info *vpninfo = ui_vpninfo; /* Ick */
+	struct openconnect_info *vpninfo = UI_get0_user_data(ui);
 	struct ui_data *ui_data;
 
 	if (!vpninfo || !vpninfo->process_auth_form)
@@ -354,6 +363,7 @@ static int ui_open(UI *ui)
 	ui_data->last_opt = &ui_data->form.opts;
 	ui_data->vpninfo = vpninfo;
 	ui_data->form.auth_id = (char *)"openssl_ui";
+
 	UI_add_user_data(ui, ui_data);
 
 	return 1;
@@ -433,41 +443,9 @@ static int ui_close(UI *ui)
 	return 1;
 }
 
-static UI_METHOD *create_openssl_ui(struct openconnect_info *vpninfo)
+static UI_METHOD *create_openssl_ui(void)
 {
 	UI_METHOD *ui_method = UI_create_method((char *)"AnyConnect VPN UI");
-
-	/* There is a race condition here because of the use of the
-	   static ui_vpninfo pointer. This sucks, but it's OpenSSL's
-	   fault and in practice it's *never* going to hurt us.
-
-	   This UI is only used for loading certificates from a TPM; for
-	   PKCS#12 and PEM files we hook the passphrase request differently.
-	   The ui_vpninfo variable is set here, and is used from ui_open()
-	   when the TPM ENGINE decides it needs to ask the user for a PIN.
-
-	   The race condition exists because theoretically, there
-	   could be more than one thread using libopenconnect and
-	   trying to authenticate to a VPN server, within the *same*
-	   process. And if *both* are using certificates from the TPM,
-	   and *both* manage to be within that short window of time
-	   between setting ui_vpninfo and invoking ui_open() to fetch
-	   the PIN, then one connection's ->process_auth_form() could
-	   get a PIN request for the *other* connection.
-
-	   However, the only thing that ever does run libopenconnect more
-	   than once from the same process is KDE's NetworkManager support,
-	   and NetworkManager doesn't *support* having more than one VPN
-	   connected anyway, so first that would have to be fixed and then
-	   you'd have to connect to two VPNs simultaneously by clicking
-	   'connect' on both at *exactly* the same time and then getting
-	   *really* unlucky.
-
-	   Oh, and the KDE support won't be using OpenSSL anyway because of
-	   licensing conflicts... so although this sucks, I'm not going to
-	   lose sleep over it.
-	*/
-	ui_vpninfo = vpninfo;
 
 	/* Set up a UI method of our own for password/passphrase requests */
 	UI_method_set_opener(ui_method, ui_open);
@@ -498,12 +476,12 @@ static int pem_pw_cb(char *buf, int len, int w, void *v)
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("PEM password too long (%d >= %d)\n"),
 			     plen, len);
-		free(pass);
+		free_pass(&pass);
 		return -1;
 	}
 
 	memcpy(buf, pass, plen+1);
-	free(pass);
+	free_pass(&pass);
 	return plen;
 }
 
@@ -566,7 +544,7 @@ static int load_pkcs12_certificate(struct openconnect_info *vpninfo, PKCS12 *p12
 			if (pass)
 				vpn_progress(vpninfo, PRG_ERR,
 					     _("Failed to decrypt PKCS#12 certificate file\n"));
-			free(pass);
+			free_pass(&pass);
 			if (request_passphrase(vpninfo, "openconnect_pkcs12", &pass,
 					       _("Enter PKCS#12 pass phrase:")) < 0) {
 				PKCS12_free(p12);
@@ -581,10 +559,10 @@ static int load_pkcs12_certificate(struct openconnect_info *vpninfo, PKCS12 *p12
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Parse PKCS#12 failed (see above errors)\n"));
 		PKCS12_free(p12);
-		free(pass);
+		free_pass(&pass);
 		return -EINVAL;
 	}
-	free(pass);
+	free_pass(&pass);
 	if (cert) {
 		char buf[200];
 		vpninfo->cert_x509 = cert;
@@ -599,7 +577,12 @@ static int load_pkcs12_certificate(struct openconnect_info *vpninfo, PKCS12 *p12
 	}
 
 	if (pkey) {
-		SSL_CTX_use_PrivateKey(vpninfo->https_ctx, pkey);
+		if (!SSL_CTX_use_PrivateKey(vpninfo->https_ctx, pkey)) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Loading private key failed\n"));
+			openconnect_report_ssl_errors(vpninfo);
+			ret = -EINVAL;
+		}
 		EVP_PKEY_free(pkey);
 	} else {
 		vpn_progress(vpninfo, PRG_ERR,
@@ -615,7 +598,8 @@ static int load_pkcs12_certificate(struct openconnect_info *vpninfo, PKCS12 *p12
 }
 
 #ifdef HAVE_ENGINE
-static int load_tpm_certificate(struct openconnect_info *vpninfo)
+static int load_tpm_certificate(struct openconnect_info *vpninfo,
+				const char *engine)
 {
 	ENGINE *e;
 	EVP_PKEY *key;
@@ -624,7 +608,11 @@ static int load_tpm_certificate(struct openconnect_info *vpninfo)
 
 	ENGINE_load_builtin_engines();
 
-	e = ENGINE_by_id("tpm");
+	e = ENGINE_by_id(engine);
+	if (!e && !strcmp(engine, "tpm2")) {
+		ERR_clear_error();
+		e = ENGINE_by_id("tpm2tss");
+	}
 	if (!e) {
 		vpn_progress(vpninfo, PRG_ERR, _("Can't load TPM engine.\n"));
 		openconnect_report_ssl_errors(vpninfo);
@@ -645,13 +633,13 @@ static int load_tpm_certificate(struct openconnect_info *vpninfo)
 				     _("Failed to set TPM SRK password\n"));
 			openconnect_report_ssl_errors(vpninfo);
 		}
-		vpninfo->cert_password = NULL;
-		free(vpninfo->cert_password);
-	} else {
-		/* Provide our own UI method to handle the PIN callback. */
-		meth = create_openssl_ui(vpninfo);
+		free_pass(&vpninfo->cert_password);
 	}
-	key = ENGINE_load_private_key(e, vpninfo->sslkey, meth, NULL);
+
+	/* Provide our own UI method to handle the PIN callback. */
+	meth = create_openssl_ui();
+
+	key = ENGINE_load_private_key(e, vpninfo->sslkey, meth, vpninfo);
 	if (meth)
 		UI_destroy_method(meth);
 	if (!key) {
@@ -673,7 +661,8 @@ static int load_tpm_certificate(struct openconnect_info *vpninfo)
 	return ret;
 }
 #else
-static int load_tpm_certificate(struct openconnect_info *vpninfo)
+static int load_tpm_certificate(struct openconnect_info *vpninfo,
+				const char *engine)
 {
 	vpn_progress(vpninfo, PRG_ERR,
 		     _("This version of OpenConnect was built without TPM support\n"));
@@ -946,7 +935,11 @@ static int load_certificate(struct openconnect_info *vpninfo)
 	while (fgets(buf, 255, f)) {
 		if (!strcmp(buf, "-----BEGIN TSS KEY BLOB-----\n")) {
 			fclose(f);
-			return load_tpm_certificate(vpninfo);
+			return load_tpm_certificate(vpninfo, "tpm");
+		} else if (!strcmp(buf, "-----BEGIN TSS2 KEY BLOB-----\n") ||
+			   !strcmp(buf, "-----BEGIN TSS2 PRIVATE KEY-----\n")) {
+			fclose(f);
+			return load_tpm_certificate(vpninfo, "tpm2");
 		} else if (!strcmp(buf, "-----BEGIN RSA PRIVATE KEY-----\n") ||
 			   !strcmp(buf, "-----BEGIN DSA PRIVATE KEY-----\n") ||
 			   !strcmp(buf, "-----BEGIN EC PRIVATE KEY-----\n") ||
@@ -959,6 +952,7 @@ static int load_certificate(struct openconnect_info *vpninfo)
 				vpn_progress(vpninfo, PRG_ERR,
 					     _("Loading private key failed\n"));
 				openconnect_report_ssl_errors(vpninfo);
+				return -EINVAL;
 			}
 		again:
 			fseek(f, 0, SEEK_SET);
@@ -1024,7 +1018,7 @@ static int load_certificate(struct openconnect_info *vpninfo)
 					if (pass) {
 						vpn_progress(vpninfo, PRG_ERR,
 							     _("Failed to decrypt PKCS#8 certificate file\n"));
-						free(pass);
+						free_pass(&pass);
 						pass = NULL;
 					}
 
@@ -1037,13 +1031,13 @@ static int load_certificate(struct openconnect_info *vpninfo)
 					openconnect_report_ssl_errors(vpninfo);
 				}
 
-				free(pass);
+				free_pass(&pass);
 				vpninfo->cert_password = NULL;
 
 				X509_SIG_free(p8);
 				return -EINVAL;
 			}
-			free(pass);
+			free_pass(&pass);
 			vpninfo->cert_password = NULL;
 
 			key = EVP_PKCS82PKEY(p8inf);
@@ -1389,7 +1383,7 @@ static int match_cert_hostname(struct openconnect_info *vpninfo, X509 *peer_cert
 {
 	char *matched = NULL;
 
-	if (ipaddrlen && X509_check_ip(peer_cert, ipaddr, ipaddrlen, 0)) {
+	if (ipaddrlen && X509_check_ip(peer_cert, ipaddr, ipaddrlen, 0) == 1) {
 		if (vpninfo->verbose >= PRG_DEBUG) {
 			char host[80];
 			int family;
@@ -1408,7 +1402,7 @@ static int match_cert_hostname(struct openconnect_info *vpninfo, X509 *peer_cert
 		}
 		return 0;
 	}
-	if (X509_check_host(peer_cert, vpninfo->hostname, 0, 0, &matched)) {
+	if (X509_check_host(peer_cert, vpninfo->hostname, 0, 0, &matched) == 1) {
 		vpn_progress(vpninfo, PRG_DEBUG,
 			     _("Matched peer certificate subject name '%s'\n"),
 			     matched);
@@ -1484,10 +1478,14 @@ int openconnect_get_peer_cert_chain(struct openconnect_info *vpninfo,
 {
 	struct oc_cert *chain, *p;
 	X509_STORE_CTX *ctx = vpninfo->cert_list_handle;
-	STACK_OF(X509) *untrusted = X509_STORE_CTX_get0_untrusted(ctx);
+	STACK_OF(X509) *untrusted;
 	int i, cert_list_size;
 
 	if (!ctx)
+		return -EINVAL;
+
+	untrusted = X509_STORE_CTX_get0_untrusted(ctx);
+	if (!untrusted)
 		return -EINVAL;
 
 	cert_list_size = sk_X509_num(untrusted);
@@ -1655,6 +1653,7 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
 	}
 	free(vpninfo->peer_cert_hash);
 	vpninfo->peer_cert_hash = NULL;
+	free(vpninfo->cstp_cipher);
 	vpninfo->cstp_cipher = NULL;
 
 	ssl_sock = connect_https_socket(vpninfo);
@@ -1718,8 +1717,21 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
 		if (!vpninfo->no_system_trust)
 			SSL_CTX_set_default_verify_paths(vpninfo->https_ctx);
 
-		if (vpninfo->pfs)
-			SSL_CTX_set_cipher_list(vpninfo->https_ctx, "HIGH:!aNULL:!eNULL:-RSA");
+		if (!strlen(vpninfo->ciphersuite_config)) {
+			strncpy(vpninfo->ciphersuite_config, vpninfo->pfs ? "HIGH:!aNULL:!eNULL:-RSA" : "DEFAULT",
+				sizeof(vpninfo->ciphersuite_config)-1);
+		}
+
+		if (!SSL_CTX_set_cipher_list(vpninfo->https_ctx, vpninfo->ciphersuite_config)) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("Failed to set OpenSSL cipher list (\"%s\")\n"),
+				     vpninfo->ciphersuite_config);
+			openconnect_report_ssl_errors(vpninfo);
+			SSL_CTX_free(vpninfo->https_ctx);
+			vpninfo->https_ctx = NULL;
+			closesocket(ssl_sock);
+			return -EIO;
+		}
 
 #ifdef ANDROID_KEYSTORE
 		if (vpninfo->cafile && !strncmp(vpninfo->cafile, "keystore:", 9)) {
@@ -1850,7 +1862,12 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
 		}
 	}
 
-	vpninfo->cstp_cipher = (char *)SSL_get_cipher_name(https_ssl);
+	if (asprintf(&vpninfo->cstp_cipher, "%s-%s",
+		     SSL_get_version(https_ssl), SSL_get_cipher_name(https_ssl)) < 0) {
+		SSL_free(https_ssl);
+		closesocket(ssl_sock);
+		return -ENOMEM;
+	}
 
 	vpninfo->ssl_fd = ssl_sock;
 	vpninfo->https_ssl = https_ssl;
@@ -1860,8 +1877,8 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
 	vpninfo->ssl_gets = openconnect_openssl_gets;
 
 
-	vpn_progress(vpninfo, PRG_INFO, _("Connected to HTTPS on %s\n"),
-		     vpninfo->hostname);
+	vpn_progress(vpninfo, PRG_INFO, _("Connected to HTTPS on %s with ciphersuite %s\n"),
+		     vpninfo->hostname, vpninfo->cstp_cipher);
 
 	return 0;
 }
@@ -1903,10 +1920,12 @@ int openconnect_init_ssl(void)
 	if (ret)
 		return ret;
 #endif
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	SSL_library_init();
 	ERR_clear_error();
 	SSL_load_error_strings();
 	OpenSSL_add_all_algorithms();
+#endif
 	return 0;
 }
 
@@ -2001,4 +2020,122 @@ int hotp_hmac(struct openconnect_info *vpninfo, const void *challenge)
 
 	hashlen = hash[hashlen - 1] & 15;
 	return load_be32(&hash[hashlen]) & 0x7fffffff;
+}
+
+static long ttls_ctrl_func(BIO *b, int cmd, long larg, void *iarg);
+static int ttls_pull_func(BIO *b, char *buf, int len);
+static int ttls_push_func(BIO *b, const char *buf, int len);
+
+#ifdef HAVE_BIO_METH_FREE
+static BIO_METHOD *eap_ttls_method(void)
+{
+	BIO_METHOD *meth = BIO_meth_new(BIO_get_new_index(), "EAP-TTLS");
+
+	BIO_meth_set_write(meth, ttls_push_func);
+	BIO_meth_set_read(meth, ttls_pull_func);
+	BIO_meth_set_ctrl(meth, ttls_ctrl_func);
+	return meth;
+}
+#else /* !HAVE_BIO_METH_FREE */
+#define BIO_TYPE_EAP_TTLS 0x80
+
+static BIO_METHOD ttls_bio_meth = {
+	.type = BIO_TYPE_EAP_TTLS,
+	.name = "EAP-TTLS",
+	.bwrite = ttls_push_func,
+	.bread = ttls_pull_func,
+	.ctrl = ttls_ctrl_func,
+};
+static BIO_METHOD *eap_ttls_method(void)
+{
+	return &ttls_bio_meth;
+}
+
+static inline void BIO_set_data(BIO *b, void *p)
+{
+	b->ptr = p;
+}
+
+static inline void *BIO_get_data(BIO *b)
+{
+	return b->ptr;
+}
+
+static void BIO_set_init(BIO *b, int i)
+{
+	b->init = i;
+}
+#endif /* !HAVE_BIO_METH_FREE */
+
+static int ttls_push_func(BIO *b, const char *buf, int len)
+{
+	struct openconnect_info *vpninfo = BIO_get_data(b);
+	int ret = pulse_eap_ttls_send(vpninfo, buf, len);
+	if (ret >= 0)
+		return ret;
+
+	return 0;
+}
+
+static int ttls_pull_func(BIO *b, char *buf, int len)
+{
+	struct openconnect_info *vpninfo = BIO_get_data(b);
+	int ret = pulse_eap_ttls_recv(vpninfo, buf, len);
+	if (ret >= 0)
+		return ret;
+
+	return 0;
+}
+
+static long ttls_ctrl_func(BIO *b, int cmd, long larg, void *iarg)
+{
+	switch(cmd) {
+	case BIO_CTRL_FLUSH:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+void *establish_eap_ttls(struct openconnect_info *vpninfo)
+{
+	SSL *ttls_ssl = NULL;
+	BIO *bio;
+	int err;
+
+	if (!vpninfo->ttls_bio_meth)
+		vpninfo->ttls_bio_meth = eap_ttls_method();
+
+	bio = BIO_new(vpninfo->ttls_bio_meth);
+	BIO_set_data(bio, vpninfo);
+	BIO_set_init(bio, 1);
+	ttls_ssl = SSL_new(vpninfo->https_ctx);
+	workaround_openssl_certchain_bug(vpninfo, ttls_ssl);
+
+	SSL_set_bio(ttls_ssl, bio, bio);
+
+	SSL_set_verify(ttls_ssl, SSL_VERIFY_PEER, NULL);
+
+	vpn_progress(vpninfo, PRG_INFO, _("EAP-TTLS negotiation with %s\n"),
+		     vpninfo->hostname);
+
+	err = SSL_connect(ttls_ssl);
+	if (err == 1) {
+		vpn_progress(vpninfo, PRG_TRACE,
+			     _("Established EAP-TTLS session\n"));
+		return ttls_ssl;
+	}
+
+	err = SSL_get_error(ttls_ssl, err);
+	vpn_progress(vpninfo, PRG_ERR, _("EAP-TTLS connection failure %d\n"), err);
+	openconnect_report_ssl_errors(vpninfo);
+	SSL_free(ttls_ssl);
+	return NULL;
+}
+
+void destroy_eap_ttls(struct openconnect_info *vpninfo, void *ttls)
+{
+	SSL_free(ttls);
+	/* Leave the BIO_METH for now. It may get reused and we don't want to
+	 * have to call BIO_get_new_index() more times than is necessary */
 }

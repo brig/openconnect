@@ -10,31 +10,39 @@
 #
 # It should also be fairly simple to extend this to cross-compile for any target
 
-NDK     := /opt/android-sdk-linux_x86/android-ndk-r10d/
-ARCH    := arm
+# Last tested with https://dl.google.com/android/repository/android-ndk-r21b-linux-x86_64.zip
+
+
+NDK     := /opt/android-sdk-linux_x86/android-ndk-r21b
+ARCH    := x86_64
+API_LEVEL := 23
+
+EXTRA_CFLAGS :=
 
 # You should be able to just 'make ARCH=x86' and it should DTRT.
 ifeq ($(ARCH),arm)
 TRIPLET := arm-linux-androideabi
-OPENSSL_TARGET := android-armv7
-EXTRA_CFLAGS := -march=armv7-a
+EXTRA_CFLAGS := -march=armv7-a -mthumb
+endif
+ifeq ($(ARCH),arm64)
+TRIPLET := aarch64-linux-android
+API_LEVEL := 26
 endif
 ifeq ($(ARCH),x86)
 TRIPLET := i686-linux-android
-OPENSSL_TARGET := android-x86
 endif
-ifeq ($(ARCH),mips)
-TRIPLET := mipsel-linux-android
-OPENSSL_TARGET := android
-EXTRA_LDFLAGS := -lz
+ifeq ($(ARCH),x86_64)
+TRIPLET := x86_64-linux-android
 endif
 
 TOPDIR := $(shell pwd)
 DESTDIR := $(TOPDIR)/$(TRIPLET)/out
 
+EXTRA_CFLAGS += -D__ANDROID_API__=$(API_LEVEL) -O2
+
 TOOLCHAIN := $(TOPDIR)/$(TRIPLET)/toolchain
 TOOLCHAIN_BUILT := $(TOOLCHAIN)/.built
-TOOLCHAIN_OPTS := --platform=android-14 --arch=$(ARCH) \
+TOOLCHAIN_OPTS := --platform=android-$(API_LEVEL) --arch=$(ARCH) \
 		  --install-dir=$(TOOLCHAIN)
 PATH := $(TOOLCHAIN)/bin:$(PATH)
 
@@ -50,15 +58,15 @@ MAKEINSTALL=$(MAKE) INSTALL=$(TOPDIR)/install_symlink.sh
 FETCH=$(TOPDIR)/fetch.sh
 
 CONFIGURE_ARGS := --host=$(TRIPLET) --prefix=$(OC_SYSROOT) \
-		  --disable-shared --enable-static \
-		  CFLAGS="$(EXTRA_CFLAGS)"
+		  --disable-shared --enable-static --with-pic \
+		  CC=$(TRIPLET)-clang CFLAGS="$(EXTRA_CFLAGS)"
 
 SOURCE_LIST = $(LIBXML2_SRC)/configure $(GMP_SRC)/configure \
 	$(NETTLE_SRC)/configure $(GNUTLS_SRC)/configure \
 	$(STOKEN_SRC)/configure $(OATH_SRC)/configure \
 	$(LZ4_DIR)/Makefile
 
-PKG_LIST := LIBXML2 OPENSSL GMP NETTLE GNUTLS STOKEN OATH LZ4
+PKG_LIST := LIBXML2 GMP NETTLE GNUTLS STOKEN OATH LZ4
 
 MIRROR_TEST_TARGETS := $(addprefix mirror-test-,$(PKG_LIST))
 
@@ -72,7 +80,6 @@ all: openconnect run_pie
 # use 32-bit binaries on a 64-bit NDK installation.)
 #
 $(TOOLCHAIN_BUILT):
-	mkdir -p $(TOOLCHAIN)
 	$(NDK)/build/tools/make-standalone-toolchain.sh $(TOOLCHAIN_OPTS) || \
 		$(NDK)/build/tools/make-standalone-toolchain.sh \
 			$(TOOLCHAIN_OPTS) --system=linux-x86_64
@@ -82,14 +89,14 @@ $(TOOLCHAIN_BUILT):
 #
 # Build libxml2 with minimal configuration for OpenConnect
 #
-LIBXML2_VER := 2.9.0
+LIBXML2_VER := 2.9.10
 LIBXML2_TAR := libxml2-$(LIBXML2_VER).tar.gz
-LIBXML2_SHA1 := a43d7c0a8e463ac5a7846254f2a732a9af146fab
+LIBXML2_SHA := aafee193ffb8fe0c82d4afef6ef91972cbaf5feea100edc2f262750611b4be1f
 LIBXML2_SRC := sources/libxml2-$(LIBXML2_VER)
 LIBXML2_BUILD := $(TRIPLET)/libxml2
 
 $(LIBXML2_TAR):
-	$(FETCH) $@ $(LIBXML2_SHA1)
+	$(FETCH) $@ $(LIBXML2_SHA)
 
 $(LIBXML2_SRC)/configure: $(LIBXML2_TAR)
 	mkdir -p sources
@@ -128,57 +135,20 @@ libxml: $(LIBXML_DEPS)
 
 #####################################################################
 #
-# Build OpenSSL for Android
-#
-OPENSSL_VER := 1.0.1g
-OPENSSL_TAR := openssl-$(OPENSSL_VER).tar.gz
-OPENSSL_SHA1 := b28b3bcb1dc3ee7b55024c9f795be60eb3183e3c
-OPENSSL_DIR := $(TRIPLET)/openssl-$(OPENSSL_VER)
-
-$(OPENSSL_TAR):
-	$(FETCH) $@ $(OPENSSL_SHA1)
-
-$(OPENSSL_DIR)/Configure: $(OPENSSL_TAR)
-	mkdir -p $(TRIPLET)
-	tar xfz $< -C $(TRIPLET)
-	touch $(OPENSSL_DIR)/Configure # Make sure it's newer than Makefile and tarball
-
-$(OPENSSL_DIR)/Makefile: $(TOOLCHAIN_BUILT) $(OPENSSL_DIR)/Configure
-	cd $(OPENSSL_DIR) && perl Configure --prefix=$(OC_SYSROOT) \
-		--cross-compile-prefix=$(TRIPLET)- no-shared \
-		$(OPENSSL_TARGET):gcc
-
-$(OPENSSL_DIR)/libssl.a: $(OPENSSL_DIR)/Makefile
-	$(MAKE) -C $(OPENSSL_DIR)
-
-$(OC_SYSROOT)/lib/libssl.a: $(OPENSSL_DIR)/libssl.a
-	# Do this manually instead of using 'make install' since we want symlinks
-	mkdir -p $(OC_SYSROOT)/include/openssl
-	ln -sf $(shell pwd)/$(OPENSSL_DIR)/include/openssl/*.h $(OC_SYSROOT)/include/openssl
-	mkdir -p $(OC_SYSROOT)/lib/pkgconfig
-	ln -sf $(shell pwd)/$(OPENSSL_DIR)/*.pc $(OC_SYSROOT)/lib/pkgconfig
-	ln -sf $(shell pwd)/$(OPENSSL_DIR)/*.a $(OC_SYSROOT)/lib
-
-OPENSSL_DEPS := $(OC_SYSROOT)/lib/libssl.a
-
-openssl: $(OPENSSL_DEPS)
-
-#####################################################################
-#
 # Build GNU MP
 #
-GMP_VER := 5.1.2
-GMP_TAR := gmp-$(GMP_VER).tar.bz2
-GMP_SHA1 := 2cb498322b9be4713829d94dee944259c017d615
+GMP_VER := 6.2.0
+GMP_TAR := gmp-$(GMP_VER).tar.xz
+GMP_SHA := 258e6cd51b3fbdfc185c716d55f82c08aff57df0c6fbd143cf6ed561267a1526
 GMP_SRC := sources/gmp-$(GMP_VER)
 GMP_BUILD := $(TRIPLET)/gmp
 
 $(GMP_TAR):
-	$(FETCH) $@ $(GMP_SHA1)
+	$(FETCH) $@ $(GMP_SHA)
 
 $(GMP_SRC)/configure: $(GMP_TAR)
 	mkdir -p sources
-	tar xfj $< -C sources
+	tar -xJf $< -C sources
 	touch $@
 
 $(GMP_BUILD)/Makefile: $(TOOLCHAIN_BUILT) $(GMP_SRC)/configure
@@ -201,14 +171,14 @@ gmp: $(GMP_DEPS)
 #
 # Build nettle
 #
-NETTLE_VER := 2.7.1
+NETTLE_VER := 3.5.1
 NETTLE_TAR := nettle-$(NETTLE_VER).tar.gz
-NETTLE_SHA1 := e7477df5f66e650c4c4738ec8e01c2efdb5d1211
+NETTLE_SHA := 75cca1998761b02e16f2db56da52992aef622bf55a3b45ec538bc2eedadc9419
 NETTLE_SRC := sources/nettle-$(NETTLE_VER)
 NETTLE_BUILD := $(TRIPLET)/nettle
 
 $(NETTLE_TAR):
-	$(FETCH) $@ $(NETTLE_SHA1)
+	$(FETCH) $@ $(NETTLE_SHA)
 
 $(NETTLE_SRC)/configure: $(NETTLE_TAR)
 	mkdir -p sources
@@ -234,14 +204,14 @@ nettle: $(NETTLE_DEPS)
 #
 # Build GnuTLS
 #
-GNUTLS_VER := 3.2.21
+GNUTLS_VER := 3.6.13
 GNUTLS_TAR := gnutls-$(GNUTLS_VER).tar.xz
-GNUTLS_SHA1 := fa12e643ad21bcaf450d534f262c813d75843966
+GNUTLS_SHA := 32041df447d9f4644570cf573c9f60358e865637d69b7e59d1159b7240b52f38
 GNUTLS_SRC := sources/gnutls-$(GNUTLS_VER)
 GNUTLS_BUILD := $(TRIPLET)/gnutls
 
 $(GNUTLS_TAR):
-	$(FETCH) $@ $(GNUTLS_SHA1)
+	$(FETCH) $@ $(GNUTLS_SHA)
 
 $(GNUTLS_SRC)/configure: $(GNUTLS_TAR)
 	mkdir -p sources
@@ -259,14 +229,14 @@ $(GNUTLS_SRC)/configure: $(GNUTLS_TAR)
 $(GNUTLS_BUILD)/Makefile: $(TOOLCHAIN_BUILT) $(GNUTLS_SRC)/configure $(NETTLE_DEPS)
 	mkdir -p $(GNUTLS_BUILD)
 	cd $(GNUTLS_BUILD) && ../../$(GNUTLS_SRC)/configure $(CONFIGURE_ARGS) \
-		AUTOGEN=/bin/true \
-		--disable-threads --disable-tests --without-zlib --disable-nls \
+		AUTOGEN=/bin/false \
+		--disable-threads --disable-tests --disable-nls \
 		--disable-doc --disable-openssl-compatibility --disable-cxx \
-		--disable-openssl-compatibility --disable-ocsp \
-		--disable-openpgp-authentication --disable-anon-authentication \
-		--disable-psk-authentication --disable-srp-authentication \
+		--disable-openssl-compatibility --disable-ocsp --disable-tools \
+		--disable-anon-authentication --with-included-libtasn1 \
+		--enable-psk-authentication --disable-srp-authentication \
 		--disable-dtls-srtp-support  --enable-dhe --enable-ecdhe \
-		--disable-rsa-export
+		--with-included-unistring --without-p11-kit --disable-guile
 
 $(GNUTLS_BUILD)/lib/libgnutls.la: $(GNUTLS_BUILD)/Makefile
 	$(MAKE) -C $(GNUTLS_BUILD)
@@ -283,14 +253,14 @@ gnutls: $(GNUTLS_DEPS)
 #
 # Build libstoken
 #
-STOKEN_VER := 0.81
+STOKEN_VER := 0.92
 STOKEN_TAR := stoken-$(STOKEN_VER).tar.gz
-STOKEN_SHA1 := db36aec5a8bd3f5f92deaebdea08cb639b78da73
+STOKEN_SHA := aa2b481b058e4caf068f7e747a2dcf5772bcbf278a4f89bc9efcbf82bcc9ef5a
 STOKEN_SRC := sources/stoken-$(STOKEN_VER)
 STOKEN_BUILD := $(TRIPLET)/stoken
 
 $(STOKEN_TAR):
-	$(FETCH) $@ $(STOKEN_SHA1)
+	$(FETCH) $@ $(STOKEN_SHA)
 
 $(STOKEN_SRC)/configure: $(STOKEN_TAR)
 	mkdir -p sources
@@ -317,31 +287,33 @@ stoken: $(STOKEN_DEPS)
 #
 # Build liboath
 #
-OATH_VER := 2.4.1
+OATH_VER := 2.6.2
 OATH_TAR := oath-toolkit-$(OATH_VER).tar.gz
-OATH_SHA1 := b0ca4c5f89c12c550f7227123c2f21f45b2bf969
+OATH_SHA := b03446fa4b549af5ebe4d35d7aba51163442d255660558cd861ebce536824aa0
 OATH_SRC := sources/oath-toolkit-$(OATH_VER)
 OATH_BUILD := $(TRIPLET)/oath
 
 $(OATH_TAR):
-	$(FETCH) $@ $(OATH_SHA1)
+	$(FETCH) $@ $(OATH_SHA)
 
 $(OATH_SRC)/configure: $(OATH_TAR)
 	mkdir -p sources
 	tar xfz $< -C sources
-	cd $(OATH_SRC) && patch -p1 < ../../0001-fflush-freadahead-fseeko-Fix-for-Android.patch
+	> $(OATH_SRC)/liboath/gl/freading.c
 	touch $@
 
 $(OATH_BUILD)/Makefile: $(TOOLCHAIN_BUILT) $(OATH_SRC)/configure
 	mkdir -p $(OATH_BUILD)
 	cd $(OATH_BUILD) && ../../$(OATH_SRC)/configure $(CONFIGURE_ARGS) \
-		--disable-pskc --disable-pam
+		--disable-pskc --disable-pam \
+		gl_cv_func_fflush_stdin=yes \
+		gl_cv_func_fpurge_works=yes
 
 $(OATH_BUILD)/liboath/liboath.la: $(OATH_BUILD)/Makefile
-	$(MAKE) -C $(OATH_BUILD)
+	$(MAKE) -C $(OATH_BUILD)/liboath
 
 $(OC_SYSROOT)/lib/liboath.la: $(OATH_BUILD)/liboath/liboath.la
-	$(MAKEINSTALL) -C $(OATH_BUILD) install
+	$(MAKEINSTALL) -C $(OATH_BUILD)/liboath install
 
 OATH_DEPS := $(OC_SYSROOT)/lib/liboath.la
 
@@ -352,13 +324,13 @@ oath: $(OATH_DEPS)
 #
 # Build liblz4
 #
-LZ4_VER := r127
-LZ4_TAR := lz4-$(LZ4_VER).tar.gz
-LZ4_SHA1 := 1aa7d4bb62eb79f88b33f86f9890dc9f96797af5
+LZ4_VER := 1.9.2
+LZ4_TAR := lz4-v$(LZ4_VER).tar.gz
+LZ4_SHA := 658ba6191fa44c92280d4aa2c271b0f4fbc0e34d249578dd05e50e76d0e5efcc
 LZ4_DIR := $(TRIPLET)/lz4-$(LZ4_VER)
 
 $(LZ4_TAR):
-	$(FETCH) $@ $(LZ4_SHA1)
+	$(FETCH) $@ $(LZ4_SHA)
 
 $(LZ4_DIR)/Makefile: $(LZ4_TAR)
 	mkdir -p $(TRIPLET)
@@ -367,7 +339,7 @@ $(LZ4_DIR)/Makefile: $(LZ4_TAR)
 
 $(OC_SYSROOT)/lib/liblz4.a: $(TOOLCHAIN_BUILT) $(LZ4_DIR)/Makefile
 	$(MAKE) -C $(LZ4_DIR)/lib \
-		CC="$(TRIPLET)-gcc $(EXTRA_CFLAGS)" \
+		CC="$(TRIPLET)-clang $(EXTRA_CFLAGS)" \
 		AR="$(TRIPLET)-ar" \
 		LIBDIR=$(OC_SYSROOT)/lib \
 		INCLUDEDIR=$(OC_SYSROOT)/include \
@@ -412,7 +384,7 @@ openconnect: $(OPENCONNECT_BUILD)/Makefile
 #
 $(DESTDIR)/sbin/run_pie: run_pie.c $(TOOLCHAIN_BUILT)
 	mkdir -p $(DESTDIR)/sbin
-	$(TRIPLET)-gcc $< -o $@ -ldl
+	$(TRIPLET)-clang $< -o $@ -ldl
 
 .PHONY: run_pie
 run_pie: $(DESTDIR)/sbin/run_pie
@@ -429,7 +401,7 @@ sources: $(SOURCE_LIST)
 
 .PHONY: $(MIRROR_TEST_TARGETS)
 $(MIRROR_TEST_TARGETS) : mirror-test-% :
-	$(FETCH) --mirror-test $($(*)_TAR) $($(*)_SHA1)
+	$(FETCH) --mirror-test $($(*)_TAR) $($(*)_SHA)
 
 # (re)test all mirrors for all packages. safe for use with "make -jN"
 .PHONY: mirror-test

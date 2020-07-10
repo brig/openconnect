@@ -38,6 +38,12 @@
 #include <sys/statfs.h>
 #endif
 
+/* setsockopt and TCP_NODELAY */
+#ifndef _WIN32
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
+
 #include "openconnect-internal.h"
 
 #ifdef ANDROID_KEYSTORE
@@ -47,6 +53,15 @@
 /* OSX < 1.6 doesn't have AI_NUMERICSERV */
 #ifndef AI_NUMERICSERV
 #define AI_NUMERICSERV 0
+#endif
+
+/* GNU Hurd doesn't yet declare IPV6_TCLASS */
+#ifndef IPV6_TCLASS
+#if defined(__GNU__)
+#define IPV6_TCLASS 61
+#elif defined(__APPLE__)
+#define IPV6_TCLASS 36
+#endif
 #endif
 
 static inline int connect_pending()
@@ -73,11 +88,14 @@ static int cancellable_connect(struct openconnect_info *vpninfo, int sockfd,
 	int maxfd = sockfd;
 	int err;
 
-	set_sock_nonblock(sockfd);
+	if (set_sock_nonblock(sockfd))
+		goto sockerr;
+
 	if (vpninfo->protect_socket)
 		vpninfo->protect_socket(vpninfo->cbdata, sockfd);
 
 	if (connect(sockfd, addr, addrlen) < 0 && !connect_pending()) {
+	sockerr:
 #ifdef _WIN32
 		return WSAGetLastError();
 #else
@@ -94,7 +112,12 @@ static int cancellable_connect(struct openconnect_info *vpninfo, int sockfd,
 		FD_SET(sockfd, &ex_set);
 #endif
 		cmd_fd_set(vpninfo, &rd_set, &maxfd);
-		select(maxfd + 1, &rd_set, &wr_set, &ex_set, NULL);
+		if (select(maxfd + 1, &rd_set, &wr_set, &ex_set, NULL) < 0 &&
+		    errno != EINTR) {
+			vpn_perror(vpninfo, _("Failed select() for socket connect"));
+			return -EIO;
+		}
+
 		if (is_cancel_pending(vpninfo, &rd_set)) {
 			vpn_progress(vpninfo, PRG_ERR, _("Socket connect cancelled\n"));
 			return -EINTR;
@@ -121,7 +144,7 @@ static int cancellable_connect(struct openconnect_info *vpninfo, int sockfd,
 #else
 	err = -errno;
 	if (err == -ENOTCONN) {
-		int ch;
+		char ch;
 
 		if (read(sockfd, &ch, 1) < 0)
 			err = -errno;
@@ -163,6 +186,22 @@ static int match_sockaddr(struct sockaddr *a, struct sockaddr *b)
 		return 0;
 }
 
+static int set_tcp_nodelay(struct openconnect_info *vpninfo, int ssl_sock)
+{
+	int flag = 1;
+	if (setsockopt(ssl_sock, IPPROTO_TCP, TCP_NODELAY, (void *)(&flag), sizeof(flag)) < 0) {;
+		vpn_perror(vpninfo,
+			   _("Failed setsockopt(TCP_NODELAY) on TLS socket:"));
+#ifdef _WIN32
+		return WSAGetLastError();
+#else
+		return -errno;
+#endif
+	}
+	return 0;
+}
+
+
 int connect_https_socket(struct openconnect_info *vpninfo)
 {
 	int ssl_sock = -1;
@@ -193,6 +232,7 @@ int connect_https_socket(struct openconnect_info *vpninfo)
 			}
 			set_fd_cloexec(ssl_sock);
 		}
+		set_tcp_nodelay(vpninfo, ssl_sock);
 		err = cancellable_connect(vpninfo, ssl_sock, vpninfo->peer_addr, vpninfo->peer_addrlen);
 		if (err) {
 			char *errstr;
@@ -341,6 +381,7 @@ int connect_https_socket(struct openconnect_info *vpninfo)
 			if (ssl_sock < 0)
 				continue;
 			set_fd_cloexec(ssl_sock);
+			set_tcp_nodelay(vpninfo, ssl_sock);
 			err = cancellable_connect(vpninfo, ssl_sock, rp->ai_addr, rp->ai_addrlen);
 			if (!err) {
 				/* Store the peer address we actually used, so that DTLS can
@@ -365,6 +406,7 @@ int connect_https_socket(struct openconnect_info *vpninfo)
 						     _("Failed to allocate sockaddr storage\n"));
 					closesocket(ssl_sock);
 					ssl_sock = -ENOMEM;
+					freeaddrinfo(result);
 					goto out;
 				}
 				vpninfo->peer_addrlen = rp->ai_addrlen;
@@ -822,7 +864,11 @@ void poll_cmd_fd(struct openconnect_info *vpninfo, int timeout)
 
 		FD_ZERO(&rd_set);
 		cmd_fd_set(vpninfo, &rd_set, &maxfd);
-		select(maxfd + 1, &rd_set, NULL, NULL, &tv);
+		if (select(maxfd + 1, &rd_set, NULL, NULL, &tv) < 0 &&
+		    errno != EINTR) {
+			vpn_perror(vpninfo, _("Failed select() for command socket"));
+		}
+
 		check_cmd_fd(vpninfo, &rd_set);
 	}
 }
@@ -896,6 +942,66 @@ FILE *openconnect_fopen_utf8(struct openconnect_info *vpninfo, const char *fname
 	return fdopen(fd, mode);
 }
 
+ssize_t openconnect_read_file(struct openconnect_info *vpninfo, const char *fname,
+			      char **ptr)
+{
+	int fd, len;
+	struct stat st;
+	char *buf;
+
+	fd = openconnect_open_utf8(vpninfo, fname, O_RDONLY|O_BINARY);
+	if (fd < 0) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to open %s: %s\n"),
+			     fname, strerror(errno));
+		return -ENOENT;
+	}
+
+	if (fstat(fd, &st)) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to fstat() %s: %s\n"),
+			     fname, strerror(errno));
+		close(fd);
+		return -EIO;
+	}
+
+	if (st.st_size == 0) {
+		vpn_progress(vpninfo, PRG_INFO, _("File %s is empty\n"),
+			     vpninfo->xmlconfig);
+		close(fd);
+		return -ENOENT;
+	}
+	if (st.st_size >= INT_MAX || st.st_size < 0) {
+		vpn_progress(vpninfo, PRG_INFO, _("File %s has suspicious size %zd\n"),
+			     vpninfo->xmlconfig, (ssize_t)st.st_size);
+		close(fd);
+		return -EIO;
+	}
+	len = st.st_size;
+	buf = malloc(len + 1);
+	if (!buf) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to allocate %d bytes for %s\n"),
+			     len + 1, fname);
+		close(fd);
+		return -ENOMEM;
+	}
+
+	if (read(fd, buf, len) != len) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to read %s: %s\n"),
+			     fname, strerror(errno));
+		free(buf);
+		close(fd);
+		return -EIO;
+	}
+
+	buf[len] = 0;
+	close(fd);
+	*ptr = buf;
+	return len;
+}
+
 int udp_sockaddr(struct openconnect_info *vpninfo, int port)
 {
 	free(vpninfo->dtls_addr);
@@ -913,8 +1019,10 @@ int udp_sockaddr(struct openconnect_info *vpninfo, int port)
 	} else if (vpninfo->peer_addr->sa_family == AF_INET6) {
 		struct sockaddr_in6 *sin = (void *)vpninfo->dtls_addr;
 		sin->sin6_port = htons(port);
+#if defined(IPV6_TCLASS)
 		vpninfo->dtls_tos_proto = IPPROTO_IPV6;
 		vpninfo->dtls_tos_optname = IPV6_TCLASS;
+#endif
 	} else {
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Unknown protocol family %d. Cannot create UDP server address\n"),
@@ -943,7 +1051,9 @@ int udp_connect(struct openconnect_info *vpninfo)
 		vpninfo->protect_socket(vpninfo->cbdata, fd);
 
 	sndbuf = vpninfo->ip_info.mtu * 2;
-	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (void *)&sndbuf, sizeof(sndbuf));
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (void *)&sndbuf, sizeof(sndbuf)) < 0) {
+		vpn_perror(vpninfo, "Set UDP socket send buffer");
+	}
 
 	if (vpninfo->dtls_local_port) {
 		union {
@@ -988,7 +1098,11 @@ int udp_connect(struct openconnect_info *vpninfo)
 	}
 
 	set_fd_cloexec(fd);
-	set_sock_nonblock(fd);
+	if (set_sock_nonblock(fd)) {
+		vpn_perror(vpninfo, _("Make UDP socket non-blocking"));
+		closesocket(fd);
+		return -EIO;
+	}
 
 	return fd;
 }
@@ -1010,7 +1124,12 @@ int ssl_reconnect(struct openconnect_info *vpninfo)
 	free(vpninfo->tun_pkt);
 	vpninfo->tun_pkt = NULL;
 
-	while ((ret = vpninfo->proto->tcp_connect(vpninfo))) {
+	while (1) {
+		script_config_tun(vpninfo, "attempt-reconnect");
+		ret = vpninfo->proto->tcp_connect(vpninfo);
+		if (!ret)
+			break;
+
 		if (timeout <= 0)
 			return ret;
 		if (ret == -EPERM) {
@@ -1037,4 +1156,115 @@ int ssl_reconnect(struct openconnect_info *vpninfo)
 		vpninfo->reconnected(vpninfo->cbdata);
 
 	return 0;
+}
+
+int cancellable_gets(struct openconnect_info *vpninfo, int fd,
+		     char *buf, size_t len)
+{
+	int i = 0;
+	int ret;
+
+	if (len < 2)
+		return -EINVAL;
+
+	while ((ret = cancellable_recv(vpninfo, fd, (void *)(buf + i), 1)) == 1) {
+		if (buf[i] == '\n') {
+			buf[i] = 0;
+			if (i && buf[i-1] == '\r') {
+				buf[i-1] = 0;
+				i--;
+			}
+			return i;
+		}
+		i++;
+
+		if (i >= len - 1) {
+			buf[i] = 0;
+			return i;
+		}
+	}
+	buf[i] = 0;
+	return i ?: ret;
+}
+
+int cancellable_send(struct openconnect_info *vpninfo, int fd,
+		     char *buf, size_t len)
+{
+	size_t count;
+
+	if (fd == -1)
+		return -EINVAL;
+
+	for (count = 0; count < len; ) {
+		fd_set rd_set, wr_set;
+		int maxfd = fd;
+		int i;
+
+		FD_ZERO(&wr_set);
+		FD_ZERO(&rd_set);
+		FD_SET(fd, &wr_set);
+		cmd_fd_set(vpninfo, &rd_set, &maxfd);
+
+		if (select(maxfd + 1, &rd_set, &wr_set, NULL, NULL) < 0 &&
+		    errno != EINTR) {
+			vpn_perror(vpninfo, _("Failed select() for socket send"));
+			return -EIO;
+		}
+
+		if (is_cancel_pending(vpninfo, &rd_set))
+			return -EINTR;
+
+		/* Not that this should ever be able to happen... */
+		if (!FD_ISSET(fd, &wr_set))
+			continue;
+
+		i = send(fd, (void *)&buf[count], len - count, 0);
+		if (i < 0)
+			return -errno;
+
+		count += i;
+	}
+	return count;
+}
+
+
+int cancellable_recv(struct openconnect_info *vpninfo, int fd,
+		     char *buf, size_t len)
+{
+	size_t count;
+
+	if (fd == -1)
+		return -EINVAL;
+
+	for (count = 0; count < len; ) {
+		fd_set rd_set;
+		int maxfd = fd;
+		int i;
+
+		FD_ZERO(&rd_set);
+		FD_SET(fd, &rd_set);
+		cmd_fd_set(vpninfo, &rd_set, &maxfd);
+
+		if (select(maxfd + 1, &rd_set, NULL, NULL, NULL) < 0 &&
+		    errno != EINTR) {
+			vpn_perror(vpninfo, _("Failed select() for socket recv"));
+			return -EIO;
+		}
+
+		if (is_cancel_pending(vpninfo, &rd_set))
+			return -EINTR;
+
+		/* Not that this should ever be able to happen... */
+		if (!FD_ISSET(fd, &rd_set))
+			continue;
+
+		i = recv(fd, (void *)&buf[count], len - count, 0);
+		if (i < 0)
+			return -errno;
+		else if (i == 0)
+			return -ECONNRESET;
+
+		count += i;
+	}
+	return count;
 }

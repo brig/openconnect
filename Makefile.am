@@ -24,29 +24,37 @@ openconnect_SOURCES = xml.c main.c
 openconnect_CFLAGS = $(AM_CFLAGS) $(SSL_CFLAGS) $(DTLS_SSL_CFLAGS) $(LIBXML2_CFLAGS) $(LIBPROXY_CFLAGS) $(ZLIB_CFLAGS) $(LIBSTOKEN_CFLAGS) $(LIBPSKC_CFLAGS) $(GSSAPI_CFLAGS) $(INTL_CFLAGS) $(ICONV_CFLAGS) $(LIBPCSCLITE_CFLAGS)
 openconnect_LDADD = libopenconnect.la $(SSL_LIBS) $(LIBXML2_LIBS) $(LIBPROXY_LIBS) $(INTL_LIBS) $(ICONV_LIBS)
 
-library_srcs = ssl.c http.c http-auth.c auth-common.c library.c compat.c lzs.c mainloop.c script.c ntlm.c digest.c
+if OPENCONNECT_WIN32
+openconnect_SOURCES += openconnect.rc
+endif
+library_srcs = ssl.c http.c http-auth.c auth-common.c library.c compat.c lzs.c mainloop.c script.c ntlm.c digest.c openconnect-internal.h
 lib_srcs_cisco = auth.c cstp.c
 lib_srcs_juniper = oncp.c lzo.c auth-juniper.c
-lib_srcs_gnutls = gnutls.c gnutls_pkcs12.c gnutls_tpm.c
+lib_srcs_pulse = pulse.c
+lib_srcs_globalprotect = gpst.c win32-ipicmp.h auth-globalprotect.c
+lib_srcs_oath = oath.c
+lib_srcs_oidc = oidc.c
+
+library_srcs += $(lib_srcs_juniper) $(lib_srcs_cisco) $(lib_srcs_oath) \
+		$(lib_srcs_globalprotect) $(lib_srcs_pulse) $(lib_srcs_oidc)
+
+lib_srcs_gnutls = gnutls.c gnutls_tpm.c gnutls_tpm2.c
 lib_srcs_openssl = openssl.c openssl-pkcs11.c
 lib_srcs_win32 = tun-win32.c sspi.c
 lib_srcs_posix = tun.c
 lib_srcs_gssapi = gssapi.c
 lib_srcs_iconv = iconv.c
-lib_srcs_oath = oath.c
 lib_srcs_yubikey = yubikey.c
 lib_srcs_stoken = stoken.c
 lib_srcs_esp = esp.c esp-seqno.c
 lib_srcs_dtls = dtls.c
 
-POTFILES = $(openconnect_SOURCES) $(lib_srcs_cisco) $(lib_srcs_juniper) \
-	   gnutls-esp.c gnutls-dtls.c openssl-esp.c openssl-dtls.c \
-	   $(lib_srcs_esp) $(lib_srcs_dtls) \
+POTFILES = $(openconnect_SOURCES) gnutls-esp.c gnutls-dtls.c openssl-esp.c openssl-dtls.c \
+	   $(lib_srcs_esp) $(lib_srcs_dtls) gnutls_tpm2_esys.c gnutls_tpm2_ibm.c \
 	   $(lib_srcs_openssl) $(lib_srcs_gnutls) $(library_srcs) \
 	   $(lib_srcs_win32) $(lib_srcs_posix) $(lib_srcs_gssapi) $(lib_srcs_iconv) \
-	   $(lib_srcs_oath) $(lib_srcs_yubikey) $(lib_srcs_stoken) openconnect-internal.h
+	   $(lib_srcs_yubikey) $(lib_srcs_stoken) $(lib_srcs_oidc)
 
-library_srcs += $(lib_srcs_juniper) $(lib_srcs_cisco) $(lib_srcs_oath)
 if OPENCONNECT_LIBPCSCLITE
 library_srcs += $(lib_srcs_yubikey)
 endif
@@ -60,6 +68,12 @@ if OPENCONNECT_GNUTLS
 library_srcs += $(lib_srcs_gnutls)
 lib_srcs_esp += gnutls-esp.c
 lib_srcs_dtls += gnutls-dtls.c
+endif
+if OPENCONNECT_TSS2_ESYS
+library_srcs += gnutls_tpm2_esys.c
+endif
+if OPENCONNECT_TSS2_IBM
+library_srcs += gnutls_tpm2_ibm.c
 endif
 if OPENCONNECT_OPENSSL
 library_srcs += $(lib_srcs_openssl)
@@ -77,9 +91,14 @@ library_srcs += $(lib_srcs_iconv)
 endif
 if OPENCONNECT_WIN32
 library_srcs += $(lib_srcs_win32)
+.rc.o:
+	$(WINDRES) $^ -o $@
+%.o : %.rc
+	$(WINDRES) $^ -o $@
 else
 library_srcs += $(lib_srcs_posix)
 endif
+
 
 libopenconnect_la_SOURCES = version.c $(library_srcs)
 libopenconnect_la_CFLAGS = $(AM_CFLAGS) $(SSL_CFLAGS) $(DTLS_SSL_CFLAGS) $(LIBXML2_CFLAGS) $(LIBPROXY_CFLAGS) $(ZLIB_CFLAGS) $(P11KIT_CFLAGS) $(TSS_CFLAGS) $(LIBSTOKEN_CFLAGS) $(LIBPSKC_CFLAGS) $(GSSAPI_CFLAGS) $(INTL_CFLAGS) $(ICONV_CFLAGS) $(LIBPCSCLITE_CFLAGS) $(LIBP11_CFLAGS) $(LIBLZ4_CFLAGS)
@@ -114,11 +133,17 @@ endif
 
 pkgconfig_DATA = openconnect.pc
 
-EXTRA_DIST = version.sh README.TESTS COPYING.LGPL $(lib_srcs_openssl) $(lib_srcs_gnutls)
+EXTRA_DIST = AUTHORS version.sh COPYING.LGPL openconnect.ico $(lib_srcs_openssl) $(lib_srcs_gnutls)
 EXTRA_DIST += $(shell cd "$(top_srcdir)" && \
-		git ls-tree HEAD -r --name-only -- android/ java/ 2>/dev/null)
+		git ls-tree HEAD -r --name-only -- android/ java/ trojans/ bash/ 2>/dev/null)
 
 DISTCLEANFILES = $(pkgconfig_DATA)
+
+pkglibexec_SCRIPTS = trojans/csd-post.sh trojans/csd-wrapper.sh trojans/tncc-wrapper.py \
+	trojans/hipreport.sh trojans/hipreport-android.sh trojans/tncc-emulate.py
+
+bashcompletiondir = $(datadir)/bash-completion/completions
+bashcompletion_DATA = bash/openconnect
 
 # main.c includes version.c
 openconnect-main.$(OBJEXT): version.c
@@ -128,8 +153,14 @@ version.c: $(library_srcs) $(lib_openssl_srcs) $(lib_gnutls_srcs) \
 	   openconnect.h openconnect-internal.h version.sh @GITVERSIONDEPS@
 	@cd $(srcdir) && ./version.sh $(abs_builddir)/version.c
 
+AUTHORS: @GITVERSIONDEPS@
+	@git shortlog -sen > AUTHORS
+
 tmp-dist: uncommitted-check
 	$(MAKE) $(AM_MAKEFLAGS) VERSION=$(patsubst v%,%,$(shell git describe --tags)) DISTHOOK=0 dist
+
+tmp-distdir: uncommitted-check
+	$(MAKE) $(AM_MAKEFLAGS) VERSION=$(patsubst v%,%,$(shell git describe --tags)) DISTHOOK=0 distdir
 
 uncommitted-check:
 	@if ! git update-index --refresh --unmerged || \

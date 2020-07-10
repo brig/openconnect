@@ -57,10 +57,6 @@
 #include <gnutls/abstract.h>
 #include <gnutls/x509.h>
 #include <gnutls/crypto.h>
-#ifdef HAVE_TROUSERS
-#include <trousers/tss.h>
-#include <trousers/trousers.h>
-#endif
 #endif
 
 #ifdef HAVE_ICONV
@@ -95,15 +91,6 @@
 #include <libp11.h>
 #endif
 
-#ifdef HAVE_LIBPCSCLITE
-#ifdef __APPLE__
-#include <PCSC/wintypes.h>
-#include <PCSC/winscard.h>
-#else
-#include <winscard.h>
-#endif
-#endif
-
 #ifdef ENABLE_NLS
 #include <libintl.h>
 #define _(s) dgettext("openconnect", s)
@@ -122,6 +109,15 @@
 #ifndef MAX
 #define MAX(x,y) ((x)>(y))?(x):(y)
 #endif
+#ifndef MIN
+#define MIN(x,y) ((x)<(y))?(x):(y)
+#endif
+
+/* At least MinGW headers seem not to provide IPPROTO_IPIP */
+#ifndef IPPROTO_IPIP
+#define IPPROTO_IPIP 0x04
+#endif
+
 /****************************************************************************/
 
 struct pkt {
@@ -143,6 +139,17 @@ struct pkt {
 			unsigned char pad[16];
 			unsigned char hdr[8];
 		} cstp;
+		struct {
+			unsigned char pad[8];
+			unsigned char hdr[16];
+		} gpst;
+		struct {
+			unsigned char pad[8];
+			uint32_t vendor;
+			uint32_t type;
+			uint32_t len;
+			uint32_t ident;
+		} pulse;
 	};
 	unsigned char data[];
 };
@@ -167,10 +174,11 @@ struct pkt {
 #define COMPR_DEFLATE	(1<<0)
 #define COMPR_LZS	(1<<1)
 #define COMPR_LZ4	(1<<2)
-#define COMPR_MAX	COMPR_LZ4
+#define COMPR_LZO	(1<<3)
+#define COMPR_MAX	COMPR_LZO
 
 #ifdef HAVE_LZ4
-#define COMPR_STATELESS	(COMPR_LZS | COMPR_LZ4)
+#define COMPR_STATELESS	(COMPR_LZS | COMPR_LZ4 | COMPR_LZO)
 #else
 #define COMPR_STATELESS	(COMPR_LZS)
 #endif
@@ -202,6 +210,8 @@ struct oc_text_buf {
 	int error;
 };
 
+#define TLS_MASTER_KEY_SIZE 48
+
 #define RECONNECT_INTERVAL_MIN	10
 #define RECONNECT_INTERVAL_MAX	100
 
@@ -213,8 +223,9 @@ struct oc_text_buf {
 #define AUTH_TYPE_NTLM		1
 #define AUTH_TYPE_DIGEST	2
 #define AUTH_TYPE_BASIC		3
+#define AUTH_TYPE_BEARER	4
 
-#define MAX_AUTH_TYPES		4
+#define MAX_AUTH_TYPES		5
 
 #define AUTH_DEFAULT_DISABLED	-3
 #define AUTH_DISABLED		-2
@@ -256,6 +267,7 @@ struct vpn_proto {
 	const char *name;
 	const char *pretty_name;
 	const char *description;
+	const char *udp_protocol;
 	unsigned int flags;
 	int (*vpn_close_session)(struct openconnect_info *vpninfo, const char *reason);
 
@@ -265,7 +277,7 @@ struct vpn_proto {
 	/* Establish the TCP connection (and obtain configuration) */
 	int (*tcp_connect)(struct openconnect_info *vpninfo);
 
-	int (*tcp_mainloop)(struct openconnect_info *vpninfo, int *timeout);
+	int (*tcp_mainloop)(struct openconnect_info *vpninfo, int *timeout, int readable);
 
 	/* Add headers common to each HTTP request */
 	void (*add_http_headers)(struct openconnect_info *vpninfo, struct oc_text_buf *buf);
@@ -275,13 +287,19 @@ struct vpn_proto {
 
 	/* This will actually complete the UDP connection setup/handshake on the wire,
 	   as well as transporting packets */
-	int (*udp_mainloop)(struct openconnect_info *vpninfo, int *timeout);
+	int (*udp_mainloop)(struct openconnect_info *vpninfo, int *timeout, int readable);
 
 	/* Close the connection but leave the session setup so it restarts */
 	void (*udp_close)(struct openconnect_info *vpninfo);
 
 	/* Close and destroy the (UDP) session */
 	void (*udp_shutdown)(struct openconnect_info *vpninfo);
+
+	/* Send probe packets to start or maintain the (UDP) session */
+	int (*udp_send_probes)(struct openconnect_info *vpninfo);
+
+	/* Catch probe packet confirming the (UDP) session */
+	int (*udp_catch_probe)(struct openconnect_info *vpninfo, struct pkt *p);
 };
 
 struct pkt_q {
@@ -324,7 +342,7 @@ static inline void init_pkt_queue(struct pkt_q *q)
 }
 
 #define DTLS_OVERHEAD (1 /* packet + header */ + 13 /* DTLS header */ + \
-	 20 /* biggest supported MAC (SHA1) */ +  16 /* biggest supported IV (AES-128) */ + \
+	 20 /* biggest supported MAC (SHA1) */ +  32 /* biggest supported IV (AES-256) */ + \
 	 16 /* max padding */)
 
 struct esp {
@@ -332,7 +350,7 @@ struct esp {
 	gnutls_cipher_hd_t cipher;
 	gnutls_hmac_hd_t hmac;
 #elif defined(OPENCONNECT_OPENSSL)
-	HMAC_CTX *hmac, *pkt_hmac;
+	HMAC_CTX *hmac;
 	EVP_CIPHER_CTX *cipher;
 #endif
 	uint64_t seq_backlog;
@@ -340,7 +358,12 @@ struct esp {
 	uint32_t spi; /* Stored network-endian */
 	unsigned char enc_key[0x40]; /* Encryption key */
 	unsigned char hmac_key[0x40]; /* HMAC key */
+	unsigned char iv[16];
 };
+
+struct oc_pcsc_ctx;
+struct oc_tpm1_ctx;
+struct oc_tpm2_ctx;
 
 struct openconnect_info {
 	const struct vpn_proto *proto;
@@ -365,6 +388,8 @@ struct openconnect_info {
 	struct esp esp_out;
 	int enc_key_len;
 	int hmac_key_len;
+	int hmac_out_len;
+	uint32_t esp_magic;  /* GlobalProtect magic ping address (network-endian) */
 
 	int tncc_fd; /* For Juniper TNCC */
 	const char *csd_xmltag;
@@ -395,6 +420,7 @@ struct openconnect_info {
 	int proxy_fd;
 	char *proxy_user;
 	char *proxy_pass;
+	char *bearer_token;
 	int proxy_close_during_auth;
 	int retry_on_auth_fail;
 	int try_http_auth;
@@ -418,7 +444,10 @@ struct openconnect_info {
 	int nopasswd;
 	int xmlpost;
 	char *dtls_ciphers;
+	char *dtls12_ciphers;
 	char *csd_wrapper;
+	int trojan_interval;
+	time_t last_trojan;
 	int no_http_keepalive;
 	int dump_http_traffic;
 
@@ -449,12 +478,10 @@ struct openconnect_info {
 		HOTP_SECRET_HEX,
 		HOTP_SECRET_PSKC,
 	} hotp_secret_format; /* We need to give it back in the same form */
+
 #ifdef HAVE_LIBPCSCLITE
-	SCARDHANDLE pcsc_ctx, pcsc_card;
-	char *yubikey_objname;
+	struct oc_pcsc_ctx *pcsc;
 	unsigned char yubikey_pwhash[16];
-	int yubikey_pw_set;
-	int yubikey_mode;
 #endif
 	openconnect_lock_token_vfn lock_token;
 	openconnect_unlock_token_vfn unlock_token;
@@ -478,6 +505,7 @@ struct openconnect_info {
 	struct oc_vpn_option *csd_env;
 
 	unsigned pfs;
+	unsigned no_tls13;
 #if defined(OPENCONNECT_OPENSSL)
 #ifdef HAVE_LIBP11
 	PKCS11_CTX *pkcs11_ctx;
@@ -490,29 +518,28 @@ struct openconnect_info {
 	X509 *cert_x509;
 	SSL_CTX *https_ctx;
 	SSL *https_ssl;
+	BIO_METHOD *ttls_bio_meth;
 #elif defined(OPENCONNECT_GNUTLS)
 	gnutls_session_t https_sess;
+	gnutls_session_t eap_ttls_sess;
 	gnutls_certificate_credentials_t https_cred;
 	gnutls_psk_client_credentials_t psk_cred;
 	char local_cert_md5[MD5_SIZE * 2 + 1]; /* For CSD */
-	char gnutls_prio[256];
 #ifdef HAVE_TROUSERS
-	TSS_HCONTEXT tpm_context;
-	TSS_HKEY srk;
-	TSS_HPOLICY srk_policy;
-	TSS_HKEY tpm_key;
-	TSS_HPOLICY tpm_key_policy;
+	struct oc_tpm1_ctx *tpm1;
 #endif
-#ifndef HAVE_GNUTLS_CERTIFICATE_SET_KEY
-#ifdef HAVE_P11KIT
-	gnutls_pkcs11_privkey_t my_p11key;
-#endif
-	gnutls_privkey_t my_pkey;
-	gnutls_x509_crt_t *my_certs;
-	uint8_t *free_my_certs;
-	unsigned int nr_my_certs;
+#ifdef HAVE_TSS2
+	struct oc_tpm2_ctx *tpm2;
 #endif
 #endif /* OPENCONNECT_GNUTLS */
+	char ciphersuite_config[256];
+	struct oc_text_buf *ttls_pushbuf;
+	uint8_t ttls_eap_ident;
+	unsigned char *ttls_recvbuf;
+	int ttls_recvpos;
+	int ttls_recvlen;
+	uint32_t ttls_msgleft;
+
 	struct pin_cache *pin_cache;
 	struct keepalive_info ssl_times;
 	int owe_ssl_dpd_response;
@@ -548,19 +575,23 @@ struct openconnect_info {
 	   NULL or not or pass it to DTLS_SEND/DTLS_RECV. This way we
 	   have fewer ifdefs and accessor macros for it. */
 	gnutls_session_t dtls_ssl;
-	char *gnutls_dtls_cipher; /* cached for openconnect_get_dtls_cipher() */
 #endif
-	char *cstp_cipher;
+	char *cstp_cipher; /* library-dependent description of TLS cipher */
+	char *dtls_cipher_desc; /* library-dependent description of DTLS cipher, cached for openconnect_get_dtls_cipher() */
 
 	int dtls_state;
 	int dtls_need_reconnect;
 	struct keepalive_info dtls_times;
 	unsigned char dtls_session_id[32];
-	unsigned char dtls_secret[48];
+	unsigned char dtls_secret[TLS_MASTER_KEY_SIZE];
 	unsigned char dtls_app_id[32];
 	unsigned dtls_app_id_size;
 
-	char *dtls_cipher;
+	uint32_t ift_seq;
+
+	int cisco_dtls12; /* If Cisco server sent X-DTLS12-CipherSuite header, rather than X-DTLS-CipherSuite */
+	char *dtls_cipher; /* Value of aforementioned header (PSK-NEGOTIATE, or an OpenSSL cipher name) */
+
 	char *vpnc_script;
 #ifndef _WIN32
 	int uid_csd_given;
@@ -579,6 +610,7 @@ struct openconnect_info {
 
 	struct oc_ip_info ip_info;
 	int cstp_basemtu; /* Returned by server */
+	int idle_timeout; /* Returned by server */
 
 #ifdef _WIN32
 	long dtls_monitored, ssl_monitored, cmd_monitored, tun_monitored;
@@ -632,6 +664,7 @@ struct openconnect_info {
 
 	int is_dyndns; /* Attempt to redo DNS lookup on each CSTP reconnect */
 	char *useragent;
+	char *version_string;
 
 	const char *quit_reason;
 
@@ -693,11 +726,17 @@ struct openconnect_info {
 #define AC_PKT_COMPRESSED	8	/* Compressed data */
 #define AC_PKT_TERM_SERVER	9	/* Server kick */
 
-/* Encryption and HMAC algorithms (matching Juniper's binary encoding) */
+/* Encryption and HMAC algorithms (matching Juniper/Pulse binary encoding) */
 #define ENC_AES_128_CBC		2
 #define ENC_AES_256_CBC		5
+
 #define HMAC_MD5		1
 #define HMAC_SHA1		2
+#define HMAC_SHA256		3
+
+#define MAX_HMAC_SIZE		32	/* SHA256 */
+#define MAX_IV_SIZE		16
+#define MAX_ESP_PAD		17	/* Including the next-header field */
 
 #define vpn_progress(_v, lvl, ...) do {					\
 	if ((_v)->verbose >= (lvl))					\
@@ -752,7 +791,16 @@ static inline int set_fd_cloexec(int fd)
 #ifdef _WIN32
 	return 0; /* Windows has O_INHERIT but... */
 #else
-	return fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+	int ret = fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+	/*
+	 * Coverity gets really sad if we don't check the error here.
+	 * But really, we're doing this to be a 'good citizen' when
+	 * running as a library, and we aren't even going to bother
+	 * printing a debug message if it fails. We just don't care.
+	 */
+	if (ret)
+		return ret;
+	return 0;
 #endif
 }
 static inline int tun_is_up(struct openconnect_info *vpninfo)
@@ -808,7 +856,7 @@ char *openconnect_legacy_to_utf8(struct openconnect_info *vpninfo, const char *l
 
 /* script.c */
 unsigned char unhex(const char *data);
-int script_setenv(struct openconnect_info *vpninfo, const char *opt, const char *val, int append);
+int script_setenv(struct openconnect_info *vpninfo, const char *opt, const char *val, int trunc, int append);
 int script_setenv_int(struct openconnect_info *vpninfo, const char *opt, int value);
 void prepare_script_env(struct openconnect_info *vpninfo);
 int script_config_tun(struct openconnect_info *vpninfo, const char *reason);
@@ -827,12 +875,16 @@ int dtls_try_handshake(struct openconnect_info *vpninfo);
 unsigned dtls_set_mtu(struct openconnect_info *vpninfo, unsigned mtu);
 void dtls_ssl_free(struct openconnect_info *vpninfo);
 
+void *establish_eap_ttls(struct openconnect_info *vpninfo);
+void destroy_eap_ttls(struct openconnect_info *vpninfo, void *sess);
+
 /* dtls.c */
 int dtls_setup(struct openconnect_info *vpninfo, int dtls_attempt_period);
-int dtls_mainloop(struct openconnect_info *vpninfo, int *timeout);
+int udp_tos_update(struct openconnect_info *vpninfo, struct pkt *pkt);
+int dtls_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
 void dtls_close(struct openconnect_info *vpninfo);
 void dtls_shutdown(struct openconnect_info *vpninfo);
-void append_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *buf);
+void gather_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *buf, struct oc_text_buf *buf12);
 void dtls_detect_mtu(struct openconnect_info *vpninfo);
 int openconnect_dtls_read(struct openconnect_info *vpninfo, void *buf, size_t len, unsigned ms);
 int openconnect_dtls_write(struct openconnect_info *vpninfo, void *buf, size_t len);
@@ -842,7 +894,7 @@ char *openconnect_bin2base64(const char *prefix, const uint8_t *data, unsigned l
 /* cstp.c */
 void cstp_common_headers(struct openconnect_info *vpninfo, struct oc_text_buf *buf);
 int cstp_connect(struct openconnect_info *vpninfo);
-int cstp_mainloop(struct openconnect_info *vpninfo, int *timeout);
+int cstp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
 int cstp_bye(struct openconnect_info *vpninfo, const char *reason);
 int decompress_and_queue_packet(struct openconnect_info *vpninfo, int compr_type,
 				unsigned char *buf, int len);
@@ -850,13 +902,41 @@ int compress_packet(struct openconnect_info *vpninfo, int compr_type, struct pkt
 
 /* auth-juniper.c */
 int oncp_obtain_cookie(struct openconnect_info *vpninfo);
+int oncp_send_tncc_command(struct openconnect_info *vpninfo, int first);
 void oncp_common_headers(struct openconnect_info *vpninfo, struct oc_text_buf *buf);
 
 /* oncp.c */
-int queue_esp_control(struct openconnect_info *vpninfo, int enable);
 int oncp_connect(struct openconnect_info *vpninfo);
-int oncp_mainloop(struct openconnect_info *vpninfo, int *timeout);
+int oncp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
 int oncp_bye(struct openconnect_info *vpninfo, const char *reason);
+void oncp_esp_close(struct openconnect_info *vpninfo);
+int oncp_esp_send_probes(struct openconnect_info *vpninfo);
+int oncp_esp_catch_probe(struct openconnect_info *vpninfo, struct pkt *pkt);
+
+/* pulse.c */
+int pulse_obtain_cookie(struct openconnect_info *vpninfo);
+void pulse_common_headers(struct openconnect_info *vpninfo, struct oc_text_buf *buf);
+int pulse_connect(struct openconnect_info *vpninfo);
+int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
+int pulse_bye(struct openconnect_info *vpninfo, const char *reason);
+int pulse_eap_ttls_send(struct openconnect_info *vpninfo, const void *data, int len);
+int pulse_eap_ttls_recv(struct openconnect_info *vpninfo, void *data, int len);
+
+/* auth-globalprotect.c */
+int gpst_obtain_cookie(struct openconnect_info *vpninfo);
+void gpst_common_headers(struct openconnect_info *vpninfo, struct oc_text_buf *buf);
+int gpst_bye(struct openconnect_info *vpninfo, const char *reason);
+const char *gpst_os_name(struct openconnect_info *vpninfo);
+
+/* gpst.c */
+int gpst_xml_or_error(struct openconnect_info *vpninfo, char *response,
+					  int (*xml_cb)(struct openconnect_info *, xmlNode *xml_node, void *cb_data),
+					  int (*challenge_cb)(struct openconnect_info *, char *prompt, char *inputStr, void *cb_data),
+					  void *cb_data);
+int gpst_setup(struct openconnect_info *vpninfo);
+int gpst_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
+int gpst_esp_send_probes(struct openconnect_info *vpninfo);
+int gpst_esp_catch_probe(struct openconnect_info *vpninfo, struct pkt *pkt);
 
 /* lzs.c */
 int lzs_decompress(unsigned char *dst, int dstlen, const unsigned char *src, int srclen);
@@ -887,11 +967,19 @@ int openconnect_open_utf8(struct openconnect_info *vpninfo,
 			  const char *fname, int mode);
 FILE *openconnect_fopen_utf8(struct openconnect_info *vpninfo,
 			     const char *fname, const char *mode);
+ssize_t openconnect_read_file(struct openconnect_info *vpninfo, const char *fname,
+			      char **ptr);
 int udp_sockaddr(struct openconnect_info *vpninfo, int port);
 int udp_connect(struct openconnect_info *vpninfo);
 int ssl_reconnect(struct openconnect_info *vpninfo);
 void openconnect_clear_cookies(struct openconnect_info *vpninfo);
+int cancellable_gets(struct openconnect_info *vpninfo, int fd,
+		     char *buf, size_t len);
 
+int cancellable_send(struct openconnect_info *vpninfo, int fd,
+		     char *buf, size_t len);
+int cancellable_recv(struct openconnect_info *vpninfo, int fd,
+		     char *buf, size_t len);
 /* openssl-pkcs11.c */
 int load_pkcs11_key(struct openconnect_info *vpninfo);
 int load_pkcs11_certificate(struct openconnect_info *vpninfo);
@@ -900,18 +988,21 @@ int load_pkcs11_certificate(struct openconnect_info *vpninfo);
 int verify_packet_seqno(struct openconnect_info *vpninfo,
 			struct esp *esp, uint32_t seq);
 int esp_setup(struct openconnect_info *vpninfo, int dtls_attempt_period);
-int esp_mainloop(struct openconnect_info *vpninfo, int *timeout);
+int esp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
 void esp_close(struct openconnect_info *vpninfo);
 void esp_shutdown(struct openconnect_info *vpninfo);
 int print_esp_keys(struct openconnect_info *vpninfo, const char *name, struct esp *esp);
+int openconnect_setup_esp_keys(struct openconnect_info *vpninfo, int new_keys);
+int construct_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt, uint8_t next_hdr);
 
 /* {gnutls,openssl}-esp.c */
-int setup_esp_keys(struct openconnect_info *vpninfo);
 void destroy_esp_ciphers(struct esp *esp);
+int init_esp_ciphers(struct openconnect_info *vpninfo, struct esp *out, struct esp *in);
 int decrypt_esp_packet(struct openconnect_info *vpninfo, struct esp *esp, struct pkt *pkt);
-int encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt);
+int encrypt_esp_packet(struct openconnect_info *vpninfo, struct pkt *pkt, int crypt_len);
 
 /* {gnutls,openssl}.c */
+const char *openconnect_get_tls_library_version();
 int ssl_nonblock_read(struct openconnect_info *vpninfo, void *buf, int maxlen);
 int ssl_nonblock_write(struct openconnect_info *vpninfo, void *buf, int buflen);
 int openconnect_open_https(struct openconnect_info *vpninfo);
@@ -938,19 +1029,19 @@ int hotp_hmac(struct openconnect_info *vpninfo, const void *challenge);
 #endif
 
 /* mainloop.c */
-int tun_mainloop(struct openconnect_info *vpninfo, int *timeout);
+int tun_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable);
 int queue_new_packet(struct pkt_q *q, void *buf, int len);
 int keepalive_action(struct keepalive_info *ka, int *timeout);
 int ka_stalled_action(struct keepalive_info *ka, int *timeout);
+int ka_check_deadline(int *timeout, time_t now, time_t due);
+int trojan_check_deadline(struct openconnect_info *vpninfo, int *timeout);
 
 /* xml.c */
-ssize_t read_file_into_string(struct openconnect_info *vpninfo, const char *fname,
-			      char **ptr);
 int config_lookup_host(struct openconnect_info *vpninfo, const char *host);
 
 /* oath.c */
-int set_totp_mode(struct openconnect_info *vpninfo, const char *token_str);
-int set_hotp_mode(struct openconnect_info *vpninfo, const char *token_str);
+int set_oath_mode(struct openconnect_info *vpninfo, const char *token_str,
+		  oc_token_mode_t token_mode);
 int can_gen_totp_code(struct openconnect_info *vpninfo,
 		      struct oc_auth_form *form,
 		      struct oc_form_opt *opt);
@@ -963,6 +1054,9 @@ int do_gen_totp_code(struct openconnect_info *vpninfo,
 int do_gen_hotp_code(struct openconnect_info *vpninfo,
 		     struct oc_auth_form *form,
 		     struct oc_form_opt *opt);
+
+int set_oidc_token(struct openconnect_info *vpninfo, 
+		     const char *token_str);
 
 /* stoken.c */
 int prepare_stoken(struct openconnect_info *vpninfo);
@@ -982,17 +1076,22 @@ int can_gen_yubikey_code(struct openconnect_info *vpninfo,
 int do_gen_yubikey_code(struct openconnect_info *vpninfo,
 			struct oc_auth_form *form,
 			struct oc_form_opt *opt);
+void release_pcsc_ctx(struct openconnect_info *info);
 
 /* auth.c */
 int cstp_obtain_cookie(struct openconnect_info *vpninfo);
+int set_csd_user(struct openconnect_info *vpninfo);
 
 /* auth-common.c */
 int xmlnode_is_named(xmlNode *xml_node, const char *name);
+int xmlnode_get_val(xmlNode *xml_node, const char *name, char **var);
 int xmlnode_get_prop(xmlNode *xml_node, const char *name, char **var);
 int xmlnode_match_prop(xmlNode *xml_node, const char *name, const char *match);
 int append_opt(struct oc_text_buf *body, const char *opt, const char *name);
 int append_form_opts(struct openconnect_info *vpninfo,
 		     struct oc_auth_form *form, struct oc_text_buf *body);
+void clear_mem(void *p, size_t s);
+void free_pass(char **p);
 void free_opt(struct oc_form_opt *opt);
 void free_auth_form(struct oc_auth_form *form);
 int do_gen_tokencode(struct openconnect_info *vpninfo,
@@ -1004,6 +1103,7 @@ int can_gen_tokencode(struct openconnect_info *vpninfo,
 /* http.c */
 struct oc_text_buf *buf_alloc(void);
 void dump_buf(struct openconnect_info *vpninfo, char prefix, char *buf);
+void dump_buf_hex(struct openconnect_info *vpninfo, int loglevel, char prefix, unsigned char *buf, int len);
 int buf_ensure_space(struct oc_text_buf *buf, int len);
 void  __attribute__ ((format (printf, 2, 3)))
 	buf_append(struct oc_text_buf *buf, const char *fmt, ...);
@@ -1014,6 +1114,7 @@ int get_utf8char(const char **utf8);
 void buf_append_from_utf16le(struct oc_text_buf *buf, const void *utf16);
 void buf_truncate(struct oc_text_buf *buf);
 void buf_append_urlencoded(struct oc_text_buf *buf, const char *str);
+void buf_append_xmlescaped(struct oc_text_buf *buf, const char *str);
 int buf_error(struct oc_text_buf *buf);
 int buf_free(struct oc_text_buf *buf);
 char *openconnect_create_useragent(const char *base);
@@ -1054,6 +1155,7 @@ int digest_authorization(struct openconnect_info *vpninfo, int proxy, struct htt
 
 /* library.c */
 void nuke_opt_values(struct oc_form_opt *opt);
+void free_optlist(struct oc_vpn_option *opt);
 int process_auth_form(struct openconnect_info *vpninfo, struct oc_auth_form *form);
 /* This is private for now since we haven't yet worked out what the API will be */
 void openconnect_set_juniper(struct openconnect_info *vpninfo);

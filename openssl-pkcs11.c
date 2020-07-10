@@ -115,6 +115,8 @@ static int parse_pkcs11_uri(const char *uri, PKCS11_TOKEN **p_tok,
 		return -ENOMEM;
 	}
 
+	*id = NULL;
+
 	/* We are only ever invoked if the string starts with 'pkcs11:' */
 	end = uri + 6;
 	while (!ret && end[0] && end[1]) {
@@ -172,6 +174,8 @@ static int parse_pkcs11_uri(const char *uri, PKCS11_TOKEN **p_tok,
 		free(tok);
 		tok = NULL;
 		free(newlabel);
+		free(*id);
+		*id = NULL;
 	}
 
 	return ret;
@@ -377,7 +381,7 @@ int load_pkcs11_certificate(struct openconnect_info *vpninfo)
 	}
 	/* If there was precisely one matching slot, and we still didn't find the cert,
 	   try logging in to it. */
-	if (matching_slots == 1 && login_slot->token->loginRequired) {
+	if (matching_slots == 1 && (login_slot->token->loginRequired || login_slot->token->userPinSet)) {
 		slot = login_slot;
 		vpn_progress(vpninfo, PRG_INFO,
 			     _("Logging in to PKCS#11 slot '%s'\n"),
@@ -611,7 +615,7 @@ int load_pkcs11_key(struct openconnect_info *vpninfo)
 		login_slot = vpninfo->pkcs11_cert_slot;
 		vpninfo->pkcs11_cert_slot = NULL;
 	}
-	if (matching_slots == 1 && login_slot->token->loginRequired) {
+	if (matching_slots == 1 && (login_slot->token->loginRequired || login_slot->token->userPinSet)) {
 		slot = login_slot;
 		vpn_progress(vpninfo, PRG_INFO,
 			     _("Logging in to PKCS#11 slot '%s'\n"),

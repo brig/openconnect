@@ -11,20 +11,23 @@ USER_KEYS = \
 	$(certsdir)/user-key-aes256-cbc-sha256.p12
 
 # We know GnuTLS doesn't support these for now. https://bugzilla.redhat.com/1369484
+OSSL_KEYS = \
+	$(certsdir)/user-key-md5-des-sha1.p12 $(certsdir)/user-key-aes256-cbc-md5-des-sha256.p12 \
+	$(certsdir)/user-key-pkcs8-pbes2-sha256.pem $(certsdir)/user-key-pkcs8-pbes2-sha256.der \
+	$(certsdir)/user-key-pkcs8-pbes1-md5-des.pem $(certsdir)/user-key-pkcs8-pbes1-md5-des.der
 if OPENCONNECT_OPENSSL
-USER_KEYS += $(certsdir)/user-key-md5-des-sha1.p12
-USER_KEYS += $(certsdir)/user-key-aes256-cbc-md5-des-sha256.p12
-USER_KEYS += $(certsdir)/user-key-pkcs8-pbes2-sha256.pem $(certsdir)/user-key-pkcs8-pbes2-sha256.der
-USER_KEYS += $(certsdir)/user-key-pkcs8-pbes1-md5-des.pem $(certsdir)/user-key-pkcs8-pbes1-md5-des.der
-endif # OPENCONNECT_OPENSSL
+USER_KEYS += $(OSSL_KEYS)
+endif
 
-if TEST_DSA
-USER_KEYS += $(certsdir)/dsa-key-pkcs1.pem $(certsdir)/dsa-key-pkcs1.der \
+DSA_KEYS = \
+	$(certsdir)/dsa-key-pkcs1.pem $(certsdir)/dsa-key-pkcs1.der \
 	$(certsdir)/dsa-key-pkcs1-aes128.pem \
 	$(certsdir)/dsa-key-pkcs8.pem $(certsdir)/dsa-key-pkcs8.der \
 	$(certsdir)/dsa-key-pkcs8-pbes2-sha1.pem $(certsdir)/dsa-key-pkcs8-pbes2-sha1.der \
 	$(certsdir)/dsa-key-aes256-cbc-sha256.p12
-endif # TEST_DSA
+if TEST_DSA
+USER_KEYS += $(DSA_KEYS)
+endif
 
 USER_KEYS += $(certsdir)/ec-key-pkcs1.pem $(certsdir)/ec-key-pkcs1.der \
 	$(certsdir)/ec-key-pkcs1-aes128.pem \
@@ -35,14 +38,22 @@ USER_KEYS += $(certsdir)/ec-key-pkcs1.pem $(certsdir)/ec-key-pkcs1.der \
 USER_CERTS = $(certsdir)/user-cert.pem $(certsdir)/dsa-cert.pem $(certsdir)/ec-cert.pem
 
 EXTRA_DIST = certs/ca.pem certs/ca-key.pem certs/user-cert.pem $(USER_KEYS) $(USER_CERTS) \
+	$(OSSL_KEYS) $(DSA_KEYS) $(certsdir)/user-key-nonascii-password.p12 \
+	pass-UTF-8 pass-ISO8859-2 \
 	certs/server-cert.pem certs/server-key.pem configs/test1.passwd \
 	common.sh configs/test-user-cert.config configs/test-user-pass.config \
-	configs/user-cert.prm softhsm2.conf.in softhsm .config/pkcs11/modules/softhsm2.module
+	configs/user-cert.prm configs/server-cert.prm \
+	softhsm2.conf.in softhsm ns.sh configs/test-dtls-psk.config \
+	scripts/vpnc-script scripts/vpnc-script-detect-disconnect
 
-dist_check_SCRIPTS =
+dist_check_SCRIPTS = autocompletion
+
+if HAVE_NETNS
+dist_check_SCRIPTS += dtls-psk sigterm
+endif
 
 if HAVE_CWRAP
-dist_check_SCRIPTS += auth-username-pass auth-certificate auth-nonascii id-test
+dist_check_SCRIPTS += auth-username-pass auth-certificate auth-nonascii cert-fingerprint id-test
 
 if TEST_PKCS11
 dist_check_SCRIPTS += auth-pkcs11
@@ -59,6 +70,10 @@ if OPENCONNECT_GNUTLS
 # the certs after we log in. Perhaps it's cached the results?
 PKCS11_TOKENS += openconnect-test2
 endif # OPENCONNECT_GNUTLS
+if OPENCONNECT_OPENSSL
+# GnuTLS build fails this one: https://gitlab.com/gnutls/gnutls/-/issues/977
+PKCS11_TOKENS += openconnect-test3
+endif # OPENCONNECT_OPENSSL
 endif # TEST_PKCS11
 endif # HAVE_CWRAP
 
@@ -71,6 +86,9 @@ TESTS_ENVIRONMENT = srcdir="$(srcdir)" \
 
 C_TESTS = lzstest seqtest
 
+if OPENCONNECT_WIN32
+C_TESTS += list-taps
+endif
 
 if CHECK_DTLS
 C_TESTS += bad_dtls_test
@@ -94,7 +112,7 @@ serverhash_LDADD = ../libopenconnect.la $(SSL_LIBS)
 # and considered part of the sources, committed to the git tree. But for
 # reference, the commands used to generate them are here...
 
-keyfiles: $(USER_KEYS) $(USER_CERTS)
+keyfiles: $(USER_KEYS) $(USER_CERTS) $(certsdir)/server-cert.pem
 
 
 OPENSSL = openssl
@@ -170,6 +188,12 @@ $(certsdir)/ec-key-pkcs1-aes128.pem: certs/ec-key-pkcs1.pem
 %.der: %.pem
 	sed -e '0,/^-----BEGIN.*KEY-----/d' -e '/^-----END.*KEY-----/,$$d' $< | base64 -d > $@
 
+$(certsdir)/server-cert.pem:
+	$(OPENSSL) req -new -config $(srcdir)/configs/server-cert.prm -key $(certsdir)/server-key.pem -out $@.csr
+	$(OPENSSL) x509 -days 3650 -CA $(certsdir)/ca.pem -CAkey $(certsdir)/ca-key.pem \
+		-extfile $(srcdir)/configs/server-cert.prm -extensions req_EXT \
+		-set_serial $(shell date +%s) -req -out $@ -in $@.csr
+
 %-cert.csr: %-key-pkcs8.pem
 	$(OPENSSL) req -new -config $(srcdir)/configs/user-cert.prm -key $< -out $@
 
@@ -183,22 +207,22 @@ P11TOOL=SOFTHSM2_CONF=softhsm2.conf p11tool
 # Nice and simple: Certs visible without login, public keys present in token
 softhsm-setup0:
 	$(SHM2_UTIL) --show-slots
-	$(SHM2_UTIL) --init-token --slot 0 --label openconnect-test \
+	$(SHM2_UTIL) --init-token --free --label openconnect-test \
 		--so-pin 12345678 --pin 1234
 
-	$(SHM2_UTIL) --slot 0 --pin 1234 --import $(certsdir)/user-key-pkcs8.pem \
+	$(SHM2_UTIL) --token openconnect-test --pin 1234 --import $(certsdir)/user-key-pkcs8.pem \
 		--label RSA --id 01
 	$(P11TOOL) --load-certificate $(certsdir)/user-cert.pem --no-mark-private \
 		   --label RSA --id 01 --set-pin 1234 --login \
 		   --write "pkcs11:token=openconnect-test;pin-value=1234"
 
-	$(SHM2_UTIL) --slot 0 --pin 1234 --import $(certsdir)/dsa-key-pkcs8.pem \
+	$(SHM2_UTIL) --token openconnect-test --pin 1234 --import $(certsdir)/dsa-key-pkcs8.pem \
 		--label DSA --id 02
 	$(P11TOOL) --load-certificate $(certsdir)/dsa-cert.pem --no-mark-private \
 		   --label DSA --id 02 --set-pin 1234 --login \
 		   --write "pkcs11:token=openconnect-test;pin-value=1234"
 
-	$(SHM2_UTIL) --slot 0 --pin 1234 --import $(certsdir)/ec-key-pkcs8.pem \
+	$(SHM2_UTIL) --token openconnect-test --pin 1234 --import $(certsdir)/ec-key-pkcs8.pem \
 			--label EC --id 03
 	$(P11TOOL) --load-certificate $(certsdir)/ec-cert.pem --no-mark-private \
 		   --label EC --id 03 --set-pin 1234 --login \
@@ -207,7 +231,7 @@ softhsm-setup0:
 # Second test: Import keys with GnuTLS so public key is absent
 softhsm-setup1:
 	$(SHM2_UTIL) --show-slots
-	$(SHM2_UTIL) --init-token --slot 1 --label openconnect-test1 \
+	$(SHM2_UTIL) --init-token --free --label openconnect-test1 \
 		--so-pin 12345678 --pin 1234
 
 	$(P11TOOL) --load-certificate $(certsdir)/user-cert.pem --no-mark-private \
@@ -228,7 +252,7 @@ softhsm-setup1:
 # Third test: CKA_PRIVATE on certificates
 softhsm-setup2:
 	$(SHM2_UTIL) --show-slots
-	$(SHM2_UTIL) --init-token --slot 2 --label openconnect-test2 \
+	$(SHM2_UTIL) --init-token --free --label openconnect-test2 \
 		--so-pin 12345678 --pin 1234
 
 	$(P11TOOL) --load-certificate $(certsdir)/user-cert.pem \
@@ -245,3 +269,33 @@ softhsm-setup2:
 		   --load-privkey $(certsdir)/ec-key-pkcs8.pem \
 		   --label EC --id 03 --login \
 		   --write "pkcs11:token=openconnect-test2;pin-value=1234"
+
+# Fourth test: token lacks CKF_LOGIN_REQUIRED (#123)
+softhsm-setup3:
+	$(SHM2_UTIL) --show-slots
+	$(SHM2_UTIL) --init-token --free --label openconnect-test3 \
+		--so-pin 12345678 --pin 1234
+
+# Remove the CKF_LOGIN_REQUIRED flag
+	TOKOBJ=$$(grep -l openconnect-test3 $(srcdir)/softhsm/*/token.object); \
+	if [ -n "$$TOKOBJ" ] && od -t x1 $$TOKOBJ | grep -q '^0000160.* 04 2d$$'; then \
+		echo -en \\x29 | dd bs=1 count=1 conv=notrunc seek=127 of=$$TOKOBJ; \
+	else \
+		echo "Token file not understood"; \
+		exit 1; \
+	fi
+
+	$(P11TOOL) --load-certificate $(certsdir)/user-cert.pem \
+		   --load-privkey $(certsdir)/user-key-pkcs8.pem \
+		   --label RSA --id 01 --login \
+		   --write "pkcs11:token=openconnect-test3;pin-value=1234"
+
+	$(P11TOOL) --load-certificate $(certsdir)/dsa-cert.pem \
+		   --load-privkey $(certsdir)/dsa-key-pkcs8.pem \
+		   --label DSA --id 02 --login \
+		   --write "pkcs11:token=openconnect-test3;pin-value=1234"
+
+	$(P11TOOL) --load-certificate $(certsdir)/ec-cert.pem \
+		   --load-privkey $(certsdir)/ec-key-pkcs8.pem \
+		   --label EC --id 03 --login \
+		   --write "pkcs11:token=openconnect-test3;pin-value=1234"

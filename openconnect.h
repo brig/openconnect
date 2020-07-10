@@ -33,12 +33,23 @@ extern "C" {
 #endif
 
 #define OPENCONNECT_API_VERSION_MAJOR 5
-#define OPENCONNECT_API_VERSION_MINOR 5
+#define OPENCONNECT_API_VERSION_MINOR 7
 
 /*
- * API version 5.5:
+ * API version 5.7:
+ *  - Add openconnect_set_cookie()
+ *
+ * API version 5.6 (v8.06; 2020-03-31):
+ *  - Add openconnect_set_trojan_interval()
+ *
+ * API version 5.5 (v8.00; 2019-01-05):
+ *  - add openconnect_set_version_string()
+ *  - add openconnect_set_key_password()
+ *  - Add openconnect_has_tss2_blob_support()
  *  - Add openconnect_get_supported_protocols()
  *  - Add openconnect_free_supported_protocols()
+ *  - Add openconnect_get_protocol()
+ *  - Add openconnect_get_idle_timeout()
  *
  * API version 5.4 (v7.08; 2016-12-13):
  *  - Add openconnect_set_pass_tos()
@@ -177,6 +188,7 @@ extern "C" {
 #define OC_PROTO_AUTH_CERT	(1<<2)
 #define OC_PROTO_AUTH_OTP	(1<<3)
 #define OC_PROTO_AUTH_STOKEN	(1<<4)
+#define OC_PROTO_PERIODIC_TROJAN	(1<<4)
 
 struct oc_vpn_proto {
 	const char *name;
@@ -340,6 +352,7 @@ typedef enum {
 	OC_TOKEN_MODE_TOTP,
 	OC_TOKEN_MODE_HOTP,
 	OC_TOKEN_MODE_YUBIOATH,
+	OC_TOKEN_MODE_OIDC,
 } oc_token_mode_t;
 
 typedef enum {
@@ -429,7 +442,7 @@ int openconnect_init_ssl(void);
 const char *openconnect_get_cstp_cipher(struct openconnect_info *);
 const char *openconnect_get_dtls_cipher(struct openconnect_info *);
 
-/* These return a descriptive string of the compression algorithm 
+/* These return a descriptive string of the compression algorithm
  * in use (LZS, LZ4, ...). If no compression then NULL is returned. */
 const char *openconnect_get_cstp_compression(struct openconnect_info *);
 const char *openconnect_get_dtls_compression(struct openconnect_info *);
@@ -504,15 +517,20 @@ void openconnect_set_xmlpost(struct openconnect_info *, int enable);
    trojan binary. */
 int openconnect_set_reported_os(struct openconnect_info *, const char *os);
 
+int openconnect_set_version_string(struct openconnect_info *vpninfo,
+				   const char *version_string);
 int openconnect_set_mobile_info(struct openconnect_info *vpninfo,
 				const char *mobile_platform_version,
 				const char *mobile_device_type,
 				const char *mobile_device_uniqueid);
 int openconnect_set_client_cert(struct openconnect_info *, const char *cert,
 				const char *sslkey);
+int openconnect_set_key_password(struct openconnect_info *vpninfo, const char *pass);
 const char *openconnect_get_ifname(struct openconnect_info *);
 void openconnect_set_reqmtu(struct openconnect_info *, int reqmtu);
 void openconnect_set_dpd(struct openconnect_info *, int min_seconds);
+void openconnect_set_trojan_interval(struct openconnect_info *, int seconds);
+int openconnect_get_idle_timeout(struct openconnect_info *);
 
 /* The returned structures are owned by the library and may be freed/replaced
    due to rekey or reconnect. Assume that once the mainloop starts, the
@@ -525,6 +543,7 @@ int openconnect_get_ip_info(struct openconnect_info *,
 
 int openconnect_get_port(struct openconnect_info *);
 const char *openconnect_get_cookie(struct openconnect_info *);
+int openconnect_set_cookie(struct openconnect_info *, const char *);
 void openconnect_clear_cookie(struct openconnect_info *);
 
 void openconnect_disable_ipv6(struct openconnect_info *vpninfo);
@@ -651,9 +670,9 @@ void openconnect_set_stats_handler(struct openconnect_info *vpninfo,
 int openconnect_has_pkcs11_support(void);
 
 /* The OpenSSL TPM ENGINE stores keys in a PEM file labelled with the string
-   -----BEGIN TSS KEY BLOB-----. GnuTLS may learn to support this format too,
-   in the near future. */
+   -----BEGIN TSS KEY BLOB-----. */
 int openconnect_has_tss_blob_support(void);
+int openconnect_has_tss2_blob_support(void);
 
 /* Software token capabilities. */
 int openconnect_has_stoken_support(void);
@@ -664,6 +683,7 @@ int openconnect_has_system_key_support(void);
 /* Query and select from among supported protocols */
 int openconnect_get_supported_protocols(struct oc_vpn_proto **protos);
 void openconnect_free_supported_protocols(struct oc_vpn_proto *protos);
+const char *openconnect_get_protocol(struct openconnect_info *vpninfo);
 int openconnect_set_protocol(struct openconnect_info *vpninfo, const char *protocol);
 
 struct addrinfo;

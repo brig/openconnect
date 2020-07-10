@@ -68,7 +68,7 @@ void *openconnect_base64_decode(int *ret_len, const char *in)
 	while (*in) {
 		if (!in[1] || !in[2] || !in[3])
 			goto err;
-	        b[0] = b64_char(in[0]);
+		b[0] = b64_char(in[0]);
 		b[1] = b64_char(in[1]);
 		if (b[0] < 0 || b[1] < 0)
 			goto err;
@@ -99,7 +99,7 @@ void *openconnect_base64_decode(int *ret_len, const char *in)
 
  err:
 	free(buf);
-	*ret_len = EINVAL;
+	*ret_len = -EINVAL;
 	return NULL;
 }
 
@@ -190,6 +190,33 @@ static int basic_authorization(struct openconnect_info *vpninfo, int proxy,
 	return 0;
 }
 
+static int bearer_authorization(struct openconnect_info *vpninfo, int proxy,
+			       struct http_auth_state *auth_state,
+			       struct oc_text_buf *hdrbuf)
+{
+	const char *bearer_token = vpninfo->bearer_token;
+
+	if (proxy) {
+		return -EINVAL;
+	}
+
+	if (!bearer_token)
+		return -EINVAL;
+
+	if (auth_state->state == AUTH_IN_PROGRESS) {
+		auth_state->state = AUTH_FAILED;
+		return -EAGAIN;
+	}
+
+	buf_append(hdrbuf, "Authorization: Bearer %s\r\n", bearer_token);
+
+	vpn_progress(vpninfo, PRG_INFO, _("Attempting HTTP Bearer authentication to server '%s'\n"),
+				vpninfo->hostname);
+
+	auth_state->state = AUTH_IN_PROGRESS;
+	return 0;
+}
+
 #if !defined(HAVE_GSSAPI) && !defined(_WIN32)
 static int no_gssapi_authorization(struct openconnect_info *vpninfo, int proxy,
 				   struct http_auth_state *auth_state,
@@ -215,6 +242,7 @@ struct auth_method {
 	{ AUTH_TYPE_NTLM, "NTLM", ntlm_authorization, cleanup_ntlm_auth },
 	{ AUTH_TYPE_DIGEST, "Digest", digest_authorization, NULL },
 	{ AUTH_TYPE_BASIC, "Basic", basic_authorization, NULL },
+	{ AUTH_TYPE_BEARER, "Bearer", bearer_authorization, NULL },
 #if !defined(HAVE_GSSAPI) && !defined(_WIN32)
 	{ AUTH_TYPE_GSSAPI, "Negotiate", no_gssapi_authorization, NULL }
 #endif

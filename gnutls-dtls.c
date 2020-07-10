@@ -35,9 +35,6 @@
 #include <gnutls/dtls.h>
 #include "gnutls.h"
 
-#if GNUTLS_VERSION_NUMBER < 0x030200
-# define GNUTLS_DTLS1_2 202
-#endif
 #if GNUTLS_VERSION_NUMBER < 0x030400
 # define GNUTLS_CIPHER_CHACHA20_POLY1305 23
 #endif
@@ -57,6 +54,7 @@ struct {
 	gnutls_mac_algorithm_t mac;
 	const char *prio;
 	const char *min_gnutls_version;
+	int cisco_dtls12;
 } gnutls_dtls_ciphers[] = {
 	{ "DHE-RSA-AES128-SHA", GNUTLS_DTLS0_9, GNUTLS_CIPHER_AES_128_CBC, GNUTLS_KX_DHE_RSA, GNUTLS_MAC_SHA1,
 	  "NONE:+VERS-DTLS0.9:+COMP-NULL:+AES-128-CBC:+SHA1:+DHE-RSA:%COMPAT", "3.0.0" },
@@ -74,6 +72,15 @@ struct {
 	  "NONE:+VERS-DTLS1.2:+COMP-NULL:+AES-256-GCM:+AEAD:+RSA:%COMPAT:+SIGN-ALL", "3.2.7" },
 	{ "OC2-DTLS1_2-CHACHA20-POLY1305", GNUTLS_DTLS1_2, GNUTLS_CIPHER_CHACHA20_POLY1305, GNUTLS_KX_PSK, GNUTLS_MAC_AEAD,
 	  "NONE:+VERS-DTLS1.2:+COMP-NULL:+CHACHA20-POLY1305:+AEAD:+PSK:%COMPAT:+SIGN-ALL", "3.4.8" },
+	/* Cisco X-DTLS12-CipherSuite: values */
+	{ "ECDHE-RSA-AES256-GCM-SHA384", GNUTLS_DTLS1_2, GNUTLS_CIPHER_AES_256_GCM, GNUTLS_KX_ECDHE_RSA, GNUTLS_MAC_AEAD,
+	  "NONE:+VERS-DTLS1.2:+COMP-NULL:+AES-256-GCM:+AEAD:+ECDHE-RSA:+SIGN-ALL:%COMPAT", "3.2.7", 1 },
+	{ "ECDHE-RSA-AES128-GCM-SHA256", GNUTLS_DTLS1_2, GNUTLS_CIPHER_AES_128_GCM, GNUTLS_KX_ECDHE_RSA, GNUTLS_MAC_AEAD,
+	  "NONE:+VERS-DTLS1.2:+COMP-NULL:+AES-128-GCM:+AEAD:+ECDHE-RSA:+SIGN-ALL:%COMPAT", "3.2.7", 1 },
+	{ "AES128-GCM-SHA256", GNUTLS_DTLS1_2, GNUTLS_CIPHER_AES_128_GCM, GNUTLS_KX_RSA, GNUTLS_MAC_AEAD,
+	  "NONE:+VERS-DTLS1.2:+COMP-NULL:+AES-128-GCM:+AEAD:+RSA:+SIGN-ALL:%COMPAT", "3.2.7", 1 },
+	{ "AES256-GCM-SHA384", GNUTLS_DTLS1_2, GNUTLS_CIPHER_AES_256_GCM, GNUTLS_KX_RSA, GNUTLS_MAC_AEAD,
+	  "NONE:+VERS-DTLS1.2:+COMP-NULL:+AES-256-GCM:+AEAD:+RSA:+SIGN-ALL:%COMPAT", "3.2.7", 1 },
 	/* NB. We agreed that any new cipher suites probably shouldn't use
 	 * Cisco's session resume hack (which ties us to a specific version
 	 * of DTLS). Instead, we'll use GNUTLS_KX_PSK and let it negotiate
@@ -82,22 +89,26 @@ struct {
 };
 
 #if GNUTLS_VERSION_NUMBER < 0x030009
-void append_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *buf)
+void gather_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *buf,
+			 struct oc_text_buf *buf12)
 {
 	int i, first = 1;
 
 	for (i = 0; i < sizeof(gnutls_dtls_ciphers) / sizeof(gnutls_dtls_ciphers[0]); i++) {
-		if (gnutls_check_version(gnutls_dtls_ciphers[i].min_gnutls_version)) {
+		if (!gnutls_dtls_ciphers[i].cisco_dtls12 &&
+		    gnutls_check_version(gnutls_dtls_ciphers[i].min_gnutls_version)) {
 			buf_append(buf, "%s%s", first ? "" : ":",
 				   gnutls_dtls_ciphers[i].name);
 			first = 0;
 		}
 	}
+}
 #else
-void append_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *buf)
+void gather_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *buf,
+			 struct oc_text_buf *buf12)
 {
 	/* only enable the ciphers that would have been negotiated in the TLS channel */
-	unsigned i, j, first = 1;
+	unsigned i, j;
 	int ret;
 	unsigned idx;
 	gnutls_cipher_algorithm_t cipher;
@@ -106,9 +117,8 @@ void append_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *b
 	uint32_t used = 0;
 
 	buf_append(buf, "PSK-NEGOTIATE");
-	first = 0;
 
-	ret = gnutls_priority_init(&cache, vpninfo->gnutls_prio, NULL);
+	ret = gnutls_priority_init(&cache, vpninfo->ciphersuite_config, NULL);
 	if (ret < 0) {
 		buf->error = -EIO;
 		return;
@@ -126,16 +136,27 @@ void append_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *b
 				if (used & (1 << i))
 					continue;
 				if (gnutls_dtls_ciphers[i].mac == mac && gnutls_dtls_ciphers[i].cipher == cipher) {
-					buf_append(buf, "%s%s", first ? "" : ":",
-						   gnutls_dtls_ciphers[i].name);
-					first = 0;
+					/* This cipher can be supported. Decide whether which list it lives
+					 * in. Cisco's DTLSv1.2 options need to go into a separate
+					 * into a separate X-DTLS12-CipherSuite header for some reason... */
+					struct oc_text_buf *list;
+
+					if (gnutls_dtls_ciphers[i].cisco_dtls12)
+						list = buf12;
+					else
+						list = buf;
+
+					if (list && list->pos)
+						buf_append(list, ":%s", gnutls_dtls_ciphers[i].name);
+					else
+						buf_append(list, "%s", gnutls_dtls_ciphers[i].name);
+
 					used |= (1 << i);
 					break;
 				}
 			}
 		}
 	}
-
 	gnutls_priority_deinit(cache);
 }
 #endif
@@ -154,31 +175,26 @@ void append_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *b
  * identifier in the client hello (draft-jay-tls-psk-identity-extension
  * could be used in the future). The session is not actually resumed.
  */
-static int start_dtls_psk_handshake(struct openconnect_info *vpninfo, int dtls_fd)
+static int start_dtls_psk_handshake(struct openconnect_info *vpninfo, gnutls_session_t dtls_ssl)
 {
-	gnutls_session_t dtls_ssl;
 	gnutls_datum_t key;
 	struct oc_text_buf *prio;
 	int err;
 
+	if (!vpninfo->https_sess) {
+		vpn_progress(vpninfo, PRG_INFO,
+			     _("Deferring DTLS resumption until CSTP generates a PSK\n"));
+		return -EAGAIN;
+	}
+
 	prio = buf_alloc();
-	buf_append(prio, "%s:-VERS-TLS-ALL:+VERS-DTLS-ALL:-KX-ALL:+PSK", vpninfo->gnutls_prio);
+	buf_append(prio, "%s:-VERS-TLS-ALL:+VERS-DTLS-ALL:-KX-ALL:+PSK", vpninfo->ciphersuite_config);
 	if (buf_error(prio)) {
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Failed to generate DTLS priority string\n"));
-		vpninfo->dtls_attempt_period = 0;
 		return buf_free(prio);
 	}
 
-
-	err = gnutls_init(&dtls_ssl, GNUTLS_CLIENT|GNUTLS_DATAGRAM|GNUTLS_NONBLOCK|GNUTLS_NO_EXTENSIONS);
-	if (err) {
-		vpn_progress(vpninfo, PRG_ERR,
-			     _("Failed to initialize DTLS: %s\n"),
-			     gnutls_strerror(err));
-		goto fail;
-	}
-	gnutls_session_set_ptr(dtls_ssl, (void *) vpninfo);
 
 	err = gnutls_priority_set_direct(dtls_ssl, prio->data, NULL);
 	if (err) {
@@ -188,8 +204,17 @@ static int start_dtls_psk_handshake(struct openconnect_info *vpninfo, int dtls_f
 		goto fail;
 	}
 
-	gnutls_transport_set_ptr(dtls_ssl,
-				 (gnutls_transport_ptr_t)(intptr_t)dtls_fd);
+	/* set our session identifier match the application ID; we do that in addition
+	 * to the extension which contains the same information in order to deprecate
+	 * the latter. The reason is that the session ID field is a field not used
+	 * with TLS1.3 (and DTLS1.3), and as such we can rely on it being available to
+	 * us, while avoiding a custom extension which requires standardization.
+	 */
+	if (vpninfo->dtls_app_id_size > 0) {
+		gnutls_datum_t id = {vpninfo->dtls_app_id, vpninfo->dtls_app_id_size};
+
+		gnutls_session_set_id(dtls_ssl, &id);
+	}
 
 	/* set PSK credentials */
 	err = gnutls_psk_allocate_client_credentials(&vpninfo->psk_cred);
@@ -236,57 +261,42 @@ static int start_dtls_psk_handshake(struct openconnect_info *vpninfo, int dtls_f
 	}
 
 	buf_free(prio);
-	vpninfo->dtls_ssl = dtls_ssl;
 	return 0;
+
  fail:
 	buf_free(prio);
-	gnutls_deinit(dtls_ssl);
 	gnutls_psk_free_client_credentials(vpninfo->psk_cred);
 	vpninfo->psk_cred = NULL;
-	vpninfo->dtls_attempt_period = 0;
 	return -EINVAL;
 }
 
-int start_dtls_handshake(struct openconnect_info *vpninfo, int dtls_fd)
+static int start_dtls_resume_handshake(struct openconnect_info *vpninfo, gnutls_session_t dtls_ssl)
 {
-	gnutls_session_t dtls_ssl;
 	gnutls_datum_t master_secret, session_id;
 	int err;
 	int cipher;
 
-	if (strcmp(vpninfo->dtls_cipher, "PSK-NEGOTIATE") == 0)
-		return start_dtls_psk_handshake(vpninfo, dtls_fd);
-
 	for (cipher = 0; cipher < sizeof(gnutls_dtls_ciphers)/sizeof(gnutls_dtls_ciphers[0]); cipher++) {
-		if (gnutls_check_version(gnutls_dtls_ciphers[cipher].min_gnutls_version) == NULL)
+		if (gnutls_dtls_ciphers[cipher].cisco_dtls12 != vpninfo->cisco_dtls12 ||
+		    gnutls_check_version(gnutls_dtls_ciphers[cipher].min_gnutls_version) == NULL)
 			continue;
 		if (!strcmp(vpninfo->dtls_cipher, gnutls_dtls_ciphers[cipher].name))
 			goto found_cipher;
 	}
 	vpn_progress(vpninfo, PRG_ERR, _("Unknown DTLS parameters for requested CipherSuite '%s'\n"),
 		     vpninfo->dtls_cipher);
-	vpninfo->dtls_attempt_period = 0;
-
 	return -EINVAL;
 
  found_cipher:
-	gnutls_init(&dtls_ssl, GNUTLS_CLIENT|GNUTLS_DATAGRAM|GNUTLS_NONBLOCK);
-	gnutls_session_set_ptr(dtls_ssl, (void *) vpninfo);
-
 	err = gnutls_priority_set_direct(dtls_ssl,
 					 gnutls_dtls_ciphers[cipher].prio,
 					 NULL);
 	if (err) {
 		vpn_progress(vpninfo, PRG_ERR,
-			     _("Failed to set DTLS priority: %s\n"),
-			     gnutls_strerror(err));
-		gnutls_deinit(dtls_ssl);
-		vpninfo->dtls_attempt_period = 0;
+			     _("Failed to set DTLS priority: '%s': %s\n"),
+			     gnutls_dtls_ciphers[cipher].prio, gnutls_strerror(err));
 		return -EINVAL;
 	}
-
-	gnutls_transport_set_ptr(dtls_ssl,
-				 (gnutls_transport_ptr_t)(intptr_t)dtls_fd);
 
 	gnutls_record_disable_padding(dtls_ssl);
 	master_secret.data = vpninfo->dtls_secret;
@@ -301,10 +311,87 @@ int start_dtls_handshake(struct openconnect_info *vpninfo, int dtls_fd)
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Failed to set DTLS session parameters: %s\n"),
 			     gnutls_strerror(err));
-		gnutls_deinit(dtls_ssl);
-		vpninfo->dtls_attempt_period = 0;
 		return -EINVAL;
 	}
+
+	return 0;
+}
+
+/*
+ * GnuTLS version between 3.6.3 and 3.6.12 send zero'ed ClientHello. Make sure
+ * we are not hitting that bug. Adapted from:
+ * https://gitlab.com/gnutls/gnutls/-/blob/3.6.13/tests/tls_hello_random_value.c
+ */
+static int check_client_hello_random(gnutls_session_t ttls_sess, unsigned int type,
+				     unsigned hook, unsigned int incoming, const gnutls_datum_t *msg)
+{
+	unsigned non_zero = 0, i;
+	struct openconnect_info *vpninfo = (struct openconnect_info *)gnutls_session_get_ptr(ttls_sess);
+
+	if (type == GNUTLS_HANDSHAKE_CLIENT_HELLO && hook == GNUTLS_HOOK_POST) {
+		gnutls_datum_t buf;
+		gnutls_session_get_random(ttls_sess, &buf, NULL);
+		if (buf.size != 32) {
+			vpn_progress(vpninfo, PRG_ERR,
+				     _("GnuTLS used %d ClientHello random bytes; this should never happen\n"),
+				     buf.size);
+			return GNUTLS_E_INVALID_REQUEST;
+		}
+
+		for (i = 0; i < buf.size; ++i) {
+			if (buf.data[i] != 0) {
+				non_zero++;
+			}
+		}
+
+		/* The GnuTLS bug was that *all* bytes were zero, but as part of the unit test
+		 * they also slipped in a coincidental check on how well the random number
+		 * generator is behaving. Eight or more zeroes is a bad thing whatever the
+		 * reason for it. So we have the same check. */
+		if (non_zero <= 8) {
+			/* TODO: mention CVE number in log message once it's assigned */
+			vpn_progress(vpninfo, PRG_ERR,
+			     _("GnuTLS sent insecure ClientHello random. Upgrade to 3.6.13 or newer.\n"));
+			return GNUTLS_E_INVALID_REQUEST;
+		}
+	}
+
+	return 0;
+}
+
+int start_dtls_handshake(struct openconnect_info *vpninfo, int dtls_fd)
+{
+	gnutls_session_t dtls_ssl;
+	int err, ret;
+
+	err = gnutls_init(&dtls_ssl, GNUTLS_CLIENT|GNUTLS_DATAGRAM|GNUTLS_NONBLOCK|GNUTLS_NO_EXTENSIONS);
+	if (err) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to initialize DTLS: %s\n"),
+			     gnutls_strerror(err));
+		return -EINVAL;
+	}
+	gnutls_session_set_ptr(dtls_ssl, (void *) vpninfo);
+	gnutls_transport_set_ptr(dtls_ssl,
+				 (gnutls_transport_ptr_t)(intptr_t)dtls_fd);
+
+	if (!strcmp(vpninfo->dtls_cipher, "PSK-NEGOTIATE"))
+		ret = start_dtls_psk_handshake(vpninfo, dtls_ssl);
+	else
+		ret = start_dtls_resume_handshake(vpninfo, dtls_ssl);
+
+	if (ret) {
+		if (ret != -EAGAIN)
+			vpninfo->dtls_attempt_period = 0;
+		gnutls_deinit(dtls_ssl);
+		return ret;
+	}
+
+	if (gnutls_check_version_numeric(3,6,3) && !gnutls_check_version_numeric(3,6,13)) {
+		gnutls_handshake_set_hook_function(dtls_ssl, GNUTLS_HANDSHAKE_CLIENT_HELLO,
+						   GNUTLS_HOOK_POST, check_client_hello_random);
+	}
+
 
 	vpninfo->dtls_ssl = dtls_ssl;
 	return 0;
@@ -354,7 +441,6 @@ int dtls_try_handshake(struct openconnect_info *vpninfo)
 				return -EIO;
 			}
 
-#ifdef HAVE_GNUTLS_DTLS_SET_DATA_MTU
 			/* Make sure GnuTLS's idea of the MTU is sufficient to take
 			   a full VPN MTU (with 1-byte header) in a data record. */
 			err = gnutls_dtls_set_data_mtu(vpninfo->dtls_ssl, vpninfo->ip_info.mtu + 1);
@@ -364,14 +450,6 @@ int dtls_try_handshake(struct openconnect_info *vpninfo)
 					     gnutls_strerror(err));
 				goto error;
 			}
-#else
-			/* If we don't have gnutls_dtls_set_data_mtu() then make sure
-			   we leave enough headroom by adding the worst-case overhead.
-			   We only support AES128-CBC and DES-CBC3-SHA anyway, so
-			   working out the worst case isn't hard. */
-			gnutls_dtls_set_mtu(vpninfo->dtls_ssl,
-					    vpninfo->ip_info.mtu + DTLS_OVERHEAD);
-#endif
 		}
 
 		vpninfo->dtls_state = DTLS_CONNECTED;

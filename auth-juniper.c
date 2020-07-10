@@ -47,7 +47,6 @@ void oncp_common_headers(struct openconnect_info *vpninfo, struct oc_text_buf *b
 {
 	http_common_headers(vpninfo, buf);
 
-	buf_append(buf, "Connection: close\r\n");
 //	buf_append(buf, "Content-Length: 256\r\n");
 	buf_append(buf, "NCP-Version: 3\r\n");
 //	buf_append(buf, "Accept-Encoding: gzip\r\n");
@@ -77,7 +76,7 @@ static int oncp_can_gen_tokencode(struct openconnect_info *vpninfo,
 
 	if (strcmp(form->auth_id, "frmDefender") &&
 	    strcmp(form->auth_id, "frmNextToken") &&
-	    strcmp(form->auth_id, "ftmTotpToken"))
+	    strcmp(form->auth_id, "frmTotpToken"))
 		return -EINVAL;
 
 	return can_gen_tokencode(vpninfo, form, opt);
@@ -122,11 +121,19 @@ static int parse_input_node(struct openconnect_info *vpninfo, struct oc_auth_for
 			ret = -ENOMEM;
 			goto out;
 		}
+	} else if (!strcasecmp(type, "username")) {
+		opt->type = OC_FORM_OPT_TEXT;
+		xmlnode_get_prop(node, "name", &opt->name);
+		if (asprintf(&opt->label, "%s:", opt->name) == -1) {
+			ret = -ENOMEM;
+			goto out;
+		}
 	} else if (!strcasecmp(type, "submit")) {
 		xmlnode_get_prop(node, "name", &opt->name);
 		if (opt->name && (!strcmp(opt->name, submit_button) ||
 				  !strcmp(opt->name, "sn-postauth-proceed") ||
-				  !strcmp(opt->name, "sn-preauth-proceed"))) {
+				  !strcmp(opt->name, "sn-preauth-proceed") ||
+				  !strcmp(opt->name, "secidactionEnter"))) {
 			/* Use this as the 'Submit' action for the form, by
 			   implicitly adding it as a hidden option. */
 			xmlnode_get_prop(node, "value", &opt->_value);
@@ -156,6 +163,7 @@ static int parse_input_node(struct openconnect_info *vpninfo, struct oc_auth_for
 			vpn_progress(vpninfo, PRG_DEBUG,
 				     _("Discarding duplicate option '%s'\n"),
 				     opt->name);
+			free_opt(opt);
 			goto out;
 		}
 		p = &(*p)->next;
@@ -191,8 +199,10 @@ static int parse_select_node(struct openconnect_info *vpninfo, struct oc_auth_fo
 			continue;
 
 		choice = calloc(1, sizeof(*choice));
-		if (!choice)
+		if (!choice) {
+			free_opt((void *)opt);
 			return -ENOMEM;
+		}
 
 		xmlnode_get_prop(node, "name", &choice->name);
 		choice->label = (char *)xmlNodeGetContent(child);
@@ -277,6 +287,39 @@ static xmlNodePtr find_form_node(xmlDocPtr doc)
 	return NULL;
 }
 
+int oncp_send_tncc_command(struct openconnect_info *vpninfo, int start)
+{
+	const char *dspreauth = vpninfo->csd_token, *dsurl = vpninfo->csd_starturl ? : "null";
+	struct oc_text_buf *buf;
+	buf = buf_alloc();
+
+	if (start) {
+		buf_append(buf, "start\n");
+		buf_append(buf, "IC=%s\n", vpninfo->hostname);
+		buf_append(buf, "Cookie=%s\n", dspreauth);
+		buf_append(buf, "DSSIGNIN=%s\n", dsurl);
+	} else {
+		buf_append(buf, "setcookie\n");
+		buf_append(buf, "Cookie=%s\n", dspreauth);
+	}
+
+	if (buf_error(buf)) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to allocate memory for communication with TNCC\n"));
+		return buf_free(buf);
+	}
+	if (cancellable_send(vpninfo, vpninfo->tncc_fd, buf->data, buf->pos) != buf->pos) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to send command to TNCC\n"));
+		buf_free(buf);
+		return -EIO;
+	}
+
+       /* Mainloop timers need to know the last Trojan was invoked */
+	vpninfo->last_trojan = time(NULL);
+	return buf_free(buf);
+}
+
 static int check_cookie_success(struct openconnect_info *vpninfo)
 {
 	const char *dslast = NULL, *dsfirst = NULL, *dsurl = NULL, *dsid = NULL;
@@ -292,21 +335,24 @@ static int check_cookie_success(struct openconnect_info *vpninfo)
 			dsid = cookie->value;
 		else if (!strcmp(cookie->option, "DSSignInUrl"))
 			dsurl = cookie->value;
+		else if (!strcmp(cookie->option, "DSSIGNIN")) {
+			free(vpninfo->csd_starturl);
+			vpninfo->csd_starturl = strdup(cookie->value);
+		} else if (!strcmp(cookie->option, "DSPREAUTH")) {
+			free(vpninfo->csd_token);
+			vpninfo->csd_token = strdup(cookie->value);
+		}
 	}
 	if (!dsid)
 		return -ENOENT;
 
-	buf = buf_alloc();
 	if (vpninfo->tncc_fd != -1) {
-		buf_append(buf, "setcookie\n");
-		buf_append(buf, "Cookie=%s\n", dsid);
-		if (buf_error(buf))
-			return buf_free(buf);
-		send(vpninfo->tncc_fd, buf->data, buf->pos, 0);
-		buf_truncate(buf);
+		/* update TNCC once we get a DSID cookie */
+		oncp_send_tncc_command(vpninfo, 0);
 	}
 
 	/* XXX: Do these need escaping? Could they theoreetically have semicolons in? */
+	buf = buf_alloc();
 	buf_append(buf, "DSID=%s", dsid);
 	if (dsfirst)
 		buf_append(buf, "; DSFirst=%s", dsfirst);
@@ -334,48 +380,30 @@ static int tncc_preauth(struct openconnect_info *vpninfo)
 {
 	int sockfd[2];
 	pid_t pid;
-	struct oc_text_buf *buf;
-	struct oc_vpn_option *cookie;
-	const char *dspreauth = NULL, *dssignin = "null";
-	char recvbuf[1024], *p;
-	int len;
+	const char *dspreauth = vpninfo->csd_token;
+	char recvbuf[1024];
+	int len, count, ret;
 
-	for (cookie = vpninfo->cookies; cookie; cookie = cookie->next) {
-		if (!strcmp(cookie->option, "DSPREAUTH"))
-			dspreauth = cookie->value;
-		else if (!strcmp(cookie->option, "DSSIGNIN"))
-			dssignin = cookie->value;
-	}
 	if (!dspreauth) {
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("No DSPREAUTH cookie; not attempting TNCC\n"));
 		return -EINVAL;
 	}
 
-	buf = buf_alloc();
-	buf_append(buf, "start\n");
-	buf_append(buf, "IC=%s\n", vpninfo->hostname);
-	buf_append(buf, "Cookie=%s\n", dspreauth);
-	buf_append(buf, "DSSIGNIN=%s\n", dssignin);
-	if (buf_error(buf)) {
-		vpn_progress(vpninfo, PRG_ERR,
-			     _("Failed to allocate memory for communication with TNCC\n"));
-		return buf_free(buf);
-	}
 #ifdef SOCK_CLOEXEC
-	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockfd))
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockfd))
 #endif
 	{
-		if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockfd)) {
-			buf_free(buf);
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockfd))
 			return -errno;
-		}
+
 		set_fd_cloexec(sockfd[0]);
 		set_fd_cloexec(sockfd[1]);
 	}
 	pid = fork();
 	if (pid == -1) {
-		buf_free(buf);
+		close(sockfd[0]);
+		close(sockfd[1]);
 		return -errno;
 	}
 
@@ -388,71 +416,117 @@ static int tncc_preauth(struct openconnect_info *vpninfo)
 		close(sockfd[1]);
 		/* The duplicated fd does not have O_CLOEXEC */
 		dup2(sockfd[0], 0);
-		/* We really don't want anything going to stdout */
-		dup2(1, 2);
+		/* We really don't want anything going to our stdout.
+		   Redirect the child's stdout, to our stderr. */
+		dup2(2, 1);
+		/* And close everything else.*/
 		for (i = 3; i < 1024 ; i++)
 			close(i);
 
+		if (setenv("TNCC_SHA256", openconnect_get_peer_cert_hash(vpninfo)+11, 1))  /* remove initial 'pin-sha256:' */
+			goto out;
+		if (setenv("TNCC_HOSTNAME", vpninfo->localname, 1))
+			goto out;
+		if (!vpninfo->trojan_interval) {
+			char is[32];
+			snprintf(is, 32, "%d", vpninfo->trojan_interval);
+			if (setenv("TNCC_INTERVAL", is, 1))
+				goto out;
+		}
+
 		execl(vpninfo->csd_wrapper, vpninfo->csd_wrapper, vpninfo->hostname, NULL);
+	out:
 		fprintf(stderr, _("Failed to exec TNCC script %s: %s\n"),
 			vpninfo->csd_wrapper, strerror(errno));
 		exit(1);
 	}
 	waitpid(pid, NULL, 0);
 	close(sockfd[0]);
+	vpninfo->tncc_fd = sockfd[1];
 
-	if (send(sockfd[1], buf->data, buf->pos, 0) != buf->pos) {
-		vpn_progress(vpninfo, PRG_ERR,
-			     _("Failed to send start command to TNCC\n"));
-		buf_free(buf);
-		close(sockfd[1]);
-		return -EIO;
+	ret = oncp_send_tncc_command(vpninfo, 1);
+	if (ret < 0) {
+	err:
+		close(vpninfo->tncc_fd);
+		vpninfo->tncc_fd = -1;
+		return ret;
 	}
-	buf_free(buf);
+
 	vpn_progress(vpninfo, PRG_DEBUG,
 		     _("Sent start; waiting for response from TNCC\n"));
 
-	len = recv(sockfd[1], recvbuf, sizeof(recvbuf) - 1, 0);
+	/* First line: HTTP-like response code. */
+	len = cancellable_gets(vpninfo, sockfd[1], recvbuf, sizeof(recvbuf));
 	if (len < 0) {
+	respfail:
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Failed to read response from TNCC\n"));
-		close(sockfd[1]);
-		return -EIO;
+		ret = -EIO;
+		goto err;
 	}
 
-	recvbuf[len] = 0;
-
-	p = strchr(recvbuf, '\n');
-	if (!p) {
-	invalid_response:
-		vpn_progress(vpninfo, PRG_ERR,
-			     _("Received invalid response from TNCC\n"));
-	print_response:
-		vpn_progress(vpninfo, PRG_TRACE, _("TNCC response: -->\n%s\n<--\n"),
-			     recvbuf);
-		close(sockfd[1]);
-		return -EINVAL;
-	}
-	*p = 0;
 	if (strcmp(recvbuf, "200")) {
 		vpn_progress(vpninfo, PRG_ERR,
 			     _("Received unsuccessful %s response from TNCC\n"),
 			     recvbuf);
-		goto print_response;
+		ret = -EINVAL;
+		goto err;
 	}
-	p = strchr(p + 1, '\n');
-	if (!p)
-		goto invalid_response;
-	dspreauth = p + 1;
-	p = strchr(p + 1, '\n');
-	if (!p)
-		goto invalid_response;
-	*p = 0;
+
+	vpn_progress(vpninfo, PRG_TRACE, _("TNCC response 200 OK\n"));
+
+	/* We're not sure what the second line is. We ignore it. */
+	len = cancellable_gets(vpninfo, sockfd[1], recvbuf, sizeof(recvbuf));
+	if (len < 0)
+		goto respfail;
+
+	vpn_progress(vpninfo, PRG_TRACE, _("Second line of TNCC response: '%s'\n"),
+		     recvbuf);
+
+	/* Third line is the DSPREAUTH cookie */
+	len = cancellable_gets(vpninfo, sockfd[1], recvbuf, sizeof(recvbuf));
+	if (len < 0)
+		goto respfail;
+
 	vpn_progress(vpninfo, PRG_DEBUG,
 		     _("Got new DSPREAUTH cookie from TNCC: %s\n"),
-		     dspreauth);
-	http_add_cookie(vpninfo, "DSPREAUTH", dspreauth, 1);
-	vpninfo->tncc_fd = sockfd[1];
+		     recvbuf);
+	http_add_cookie(vpninfo, "DSPREAUTH", recvbuf, 1);
+
+	/* Fourth line, if present, is the interval to rerun TNCC */
+	len = cancellable_gets(vpninfo, sockfd[1], recvbuf, sizeof(recvbuf));
+	if (len < 0)
+		goto respfail;
+	if (len > 0) {
+		int interval = atoi(recvbuf);
+		if (interval != 0) {
+			vpninfo->trojan_interval = interval;
+			vpn_progress(vpninfo, PRG_DEBUG,
+				     _("Got reauth interval from TNCC: %d seconds\n"),
+				     interval);
+		}
+	}
+
+	count = 0;
+	do {
+		len = cancellable_gets(vpninfo, sockfd[1], recvbuf,
+				       sizeof(recvbuf));
+		if (len < 0)
+			goto respfail;
+		if (len > 0)
+			vpn_progress(vpninfo, PRG_DEBUG,
+				     _("Unexpected non-empty line from TNCC "
+				       "after DSPREAUTH cookie: '%s'\n"),
+				     recvbuf);
+	} while (len && (count++ < 10));
+
+	if (len > 0) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Too many non-empty lines from TNCC after "
+			       "DSPREAUTH cookie\n"));
+		goto respfail;
+	}
+
 	return 0;
 }
 #endif
@@ -571,8 +645,10 @@ int oncp_obtain_cookie(struct openconnect_info *vpninfo)
 	int try_tncc = !!vpninfo->csd_wrapper;
 
 	resp_buf = buf_alloc();
-	if (buf_error(resp_buf))
-		return -ENOMEM;
+	if (buf_error(resp_buf)) {
+		ret = buf_error(resp_buf);
+		goto out;
+	}
 
 	while (1) {
 		char *form_buf = NULL;
